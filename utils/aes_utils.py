@@ -81,7 +81,7 @@ class Selector():
 
         self.model = MLP(768)  # CLIP embedding dim is 768 for CLIP ViT L 14
 
-        s = torch.load("aesthetics_model/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
+        s = torch.load("utils/aesthetics_model/sac+logos+ava1-l14-linearMSE.pth")   # load the model you trained previously or the model available in this repo
         self.model.load_state_dict(s)
 
         self.model.to(device)

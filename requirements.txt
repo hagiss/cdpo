@@ -10,3 +10,4 @@ bitsandbytes
 xformers==0.0.22
 hpsv2
 openai_clip==1.0.1
+numpy==1.26

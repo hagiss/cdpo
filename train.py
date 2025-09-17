@@ -52,6 +52,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 if is_wandb_available():
     import wandb
+    wandb.login(key="881a9b14affd90a6fe2d60376ba0f08be5a6bee8")
 
     
     
@@ -71,7 +72,16 @@ logger = get_logger(__name__, log_level="INFO")
 DATASET_NAME_MAPPING = {
     "yuvalkirstain/pickapic_v1": ("jpg_0", "jpg_1", "label_0", "caption"),
     "yuvalkirstain/pickapic_v2": ("jpg_0", "jpg_1", "label_0", "caption"),
+    "hagiss/mvv_full": ("jpg_0", "jpg_1", "label_0", "caption", "prompt", 'mps_probs', 'vqa_scores', 'vila_scores'),
 }
+
+# Fixed sample prompts for qualitative monitoring during training
+SAMPLE_PROMPTS = [
+    "A pile of sand swirling in the wind forming the shape of a dancer",
+    "A giant dinosaur frozen into a glacier and recently discovered by scientists, cinematic still",
+    "a smiling beautiful sorceress with long dark hair and closed eyes wearing a dark top surrounded by glowing fire sparks at night, magical light fog, deep focus+closeup, hyper-realistic, volumetric lighting, dramatic lighting, beautiful composition, intricate details, instagram, trending, photograph, film grain and noise, 8K, cinematic, post-production",
+    "A purple raven flying over big sur, light fog, deep focus+closeup, hyper-realistic, volumetric lighting, dramatic lighting, beautiful composition, intricate details, instagram, trending, photograph, film grain and noise, 8K, cinematic, post-production",
+]
 
         
 def import_model_class_from_model_name_or_path(
@@ -169,7 +179,7 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None,
+    parser.add_argument("--seed", type=int, default=42,
                         # was random for submission, need to test that not distributing same noise etc across devices
                         help="A seed for reproducible training.")
     parser.add_argument(
@@ -827,7 +837,7 @@ def main():
                 return do_flip(batch['jpg_0'][0], batch['jpg_1'][0], batch['caption'][0])
     elif args.train_method == 'sft':
         def preprocess_train(examples):
-            if 'pickapic' in args.dataset_name:
+            if 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
                 images = []
                 # Probably cleaner way to do this iteration
                 for im_0_bytes, im_1_bytes, label_0 in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0']):
@@ -853,15 +863,20 @@ def main():
     
     ### DATASET #####
     with accelerator.main_process_first():
-        if 'pickapic' in args.dataset_name:
-            # eliminate no-decisions (0.5-0.5 labels)
+        # Drop tie/invalid labels for any dataset (e.g., -1 ties)
+        if 'label_0' in dataset[args.split].column_names:
             orig_len = dataset[args.split].num_rows
-            not_split_idx = [i for i,label_0 in enumerate(dataset[args.split]['label_0'])
-                             if label_0 in (0,1) ]
-            dataset[args.split] = dataset[args.split].select(not_split_idx)
-            new_len = dataset[args.split].num_rows
-            print(f"Eliminated {orig_len - new_len}/{orig_len} split decisions for Pick-a-pic")
-            
+            keep_idx = [i for i, l in enumerate(dataset[args.split]['label_0']) if l in (0, 1)]
+            if len(keep_idx) != orig_len:
+                dataset[args.split] = dataset[args.split].select(keep_idx)
+                new_len = dataset[args.split].num_rows
+                print(f"Dropped {orig_len - new_len}/{orig_len} tie/invalid label examples")
+
+        # Normalize semantics for hagiss/mvv_full: original label_0==0 means jpg_0 wins
+        if 'hagiss/mvv_full' in args.dataset_name and 'label_0' in dataset[args.split].column_names:
+            dataset[args.split] = dataset[args.split].map(lambda example: {'label_0': 1 - example['label_0']})
+
+        # if 'pickapic' in args.dataset_name:
             # Below if if want to train on just the Dreamlike vs dreamlike pairs
             if args.dreamlike_pairs_only:
                 orig_len = dataset[args.split].num_rows
@@ -952,6 +967,81 @@ def main():
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
+
+    # Qualitative sampling config
+    SAMPLE_EVERY_STEPS = 100
+    SAMPLE_INFERENCE_STEPS = 50
+    SAMPLE_GUIDANCE_SCALE = 7.5
+    sample_pipe = None
+    sample_generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+
+    def _build_or_update_sample_pipeline():
+        nonlocal sample_pipe
+        unet_infer = accelerator.unwrap_model(unet)
+        unet_dtype = next(unet_infer.parameters()).dtype
+        if sample_pipe is None:
+            if args.sdxl:
+                sample_pipe_local = StableDiffusionXLPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    torch_dtype=unet_dtype,
+                )
+            else:
+                sample_pipe_local = StableDiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    revision=args.revision,
+                    torch_dtype=unet_dtype,
+                )
+            # swap in current training UNet
+            sample_pipe_local.unet = unet_infer
+            try:
+                sample_pipe_local.enable_xformers_memory_efficient_attention()
+            except Exception:
+                pass
+            sample_pipe_local.to(accelerator.device, torch_dtype=unet_dtype)
+            sample_pipe_local.set_progress_bar_config(disable=True)
+            sample_pipe = sample_pipe_local
+        else:
+            sample_pipe.unet = unet_infer
+            # keep pipeline modules in sync with UNet dtype
+            sample_pipe.to(accelerator.device, torch_dtype=unet_dtype)
+
+    # Generate an initial qualitative sample before training starts (main process only)
+    if accelerator.is_main_process:
+        _build_or_update_sample_pipeline()
+        # Log a quick weight checksum to verify training updates over time
+        try:
+            _unet_chk = next(accelerator.unwrap_model(unet).parameters()).detach().float()
+            accelerator.log({"unet_first_weight_mean": _unet_chk.mean().item()}, step=0)
+        except Exception:
+            pass
+        with torch.inference_mode():
+            _gen = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+            if args.sdxl:
+                images = sample_pipe(
+                    prompt=SAMPLE_PROMPTS,
+                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                    generator=_gen,
+                ).images
+            else:
+                images = sample_pipe(
+                    prompt=SAMPLE_PROMPTS,
+                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                    generator=_gen,
+                ).images
+        try:
+            if is_wandb_available():
+                wandb_images = [wandb.Image(img) for img in images]
+                accelerator.log({"samples": wandb_images}, step=0)
+            else:
+                out_dir = os.path.join(args.output_dir, "samples")
+                os.makedirs(out_dir, exist_ok=True)
+                for idx, img in enumerate(images):
+                    img.save(os.path.join(out_dir, f"step000000_{idx}.png"))
+        except Exception as e:
+            logger.warn(f"Failed to log pre-training samples: {e}")
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1177,6 +1267,45 @@ def main():
                     accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
                 train_loss = 0.0
                 implicit_acc_accumulated = 0.0
+
+                # Qualitative sampling every N steps (main process only)
+                if accelerator.is_main_process and (global_step % SAMPLE_EVERY_STEPS == 0):
+                    _build_or_update_sample_pipeline()
+                    # Log a quick weight checksum to verify model weight changes
+                    try:
+                        _unet_chk = next(accelerator.unwrap_model(unet).parameters()).detach().float()
+                        accelerator.log({"unet_first_weight_mean": _unet_chk.mean().item()}, step=global_step)
+                    except Exception:
+                        pass
+                    with torch.inference_mode():
+                        _gen = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                        if args.sdxl:
+                            images = sample_pipe(
+                                prompt=SAMPLE_PROMPTS,
+                                num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                                generator=_gen,
+                            ).images
+                        else:
+                            images = sample_pipe(
+                                prompt=SAMPLE_PROMPTS,
+                                num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                                generator=_gen,
+                            ).images
+                    # Log list of images to trackers (e.g., W&B)
+                    try:
+                        if is_wandb_available():
+                            wandb_images = [wandb.Image(img) for img in images]
+                            accelerator.log({"samples": wandb_images}, step=global_step)
+                        else:
+                            # Fallback: save to disk under output_dir/samples
+                            out_dir = os.path.join(args.output_dir, "samples")
+                            os.makedirs(out_dir, exist_ok=True)
+                            for idx, img in enumerate(images):
+                                img.save(os.path.join(out_dir, f"step{global_step:06d}_{idx}.png"))
+                    except Exception as e:
+                        logger.warn(f"Failed to log samples at step {global_step}: {e}")
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
