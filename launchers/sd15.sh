@@ -10,12 +10,12 @@ CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch train.py \
   --train_batch_size=16 \
   --dataloader_num_workers=16 \
   --gradient_accumulation_steps=8 \
-  --max_train_steps 500 \
-  --lr_scheduler="constant_with_warmup" --lr_warmup_steps=100 \
+  --max_train_steps 2000 \
+  --lr_scheduler="constant_with_warmup" --lr_warmup_steps=500 \
   --learning_rate=1e-8 --scale_lr \
   --cache_dir="/data3/mvv_full/" \
-  --checkpointing_steps 100 \
+  --checkpointing_steps 500 \
   --beta_dpo 5000 \
   --report_to="wandb" \
-  --output_dir="tmp-sd15-fixlabel"
+  --output_dir="tmp-sd15-fixlabel-2000steps"
 

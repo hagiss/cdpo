@@ -5,7 +5,7 @@ torch.set_grad_enabled(False)
 dpo_unet = UNet2DConditionModel.from_pretrained(
                             #  'mhdang/dpo-sd1.5-text2image-v1',
                             # 'mhdang/dpo-sdxl-text2image-v1',
-                            "tmp-sd15-4/checkpoint-100",
+                            "tmp-sd15-fixlabel/checkpoint-300",
                             # alternatively use local ckptdir (*/checkpoint-n/)
                             subfolder='unet',
                             torch_dtype=torch.float16
@@ -87,6 +87,17 @@ aes_counts = [0, 0] if aes_selector is not None else None
 hps_sums = [0.0, 0.0] if hps_selector is not None else None
 hps_counts = [0, 0] if hps_selector is not None else None
 
+# Win/Loss/Tie counters (DPO vs Orig.) per-criterion
+ps_wins = 0
+ps_losses = 0
+ps_ties = 0
+aes_wins = 0 if aes_selector is not None else None
+aes_losses = 0 if aes_selector is not None else None
+aes_ties = 0 if aes_selector is not None else None
+hps_wins = 0 if hps_selector is not None else None
+hps_losses = 0 if hps_selector is not None else None
+hps_ties = 0 if hps_selector is not None else None
+
 for p in example_prompts:
     ims = gen(p) # could save these if desired    
     # PickScore
@@ -96,6 +107,16 @@ for p in example_prompts:
         if i < len(ps_sums):
             ps_sums[i] += float(s)
             ps_counts[i] += 1
+    # Win/Loss/Tie for PickScore (index 1 is DPO, index 0 is Orig.)
+    if len(ps_scores) >= 2:
+        base_ps = float(ps_scores[0])
+        dpo_ps = float(ps_scores[1])
+        if dpo_ps > base_ps + 1e-8:
+            ps_wins += 1
+        elif base_ps > dpo_ps + 1e-8:
+            ps_losses += 1
+        else:
+            ps_ties += 1
     # Aesthetics (may be None if model not available)
     if aes_selector is not None:
         try:
@@ -105,6 +126,16 @@ for p in example_prompts:
                 if i < len(aes_sums):
                     aes_sums[i] += float(s)
                     aes_counts[i] += 1
+            # Win/Loss/Tie for AES
+            if len(aes_scores) >= 2:
+                base_aes = float(aes_scores[0])
+                dpo_aes = float(aes_scores[1])
+                if dpo_aes > base_aes + 1e-8:
+                    aes_wins += 1
+                elif base_aes > dpo_aes + 1e-8:
+                    aes_losses += 1
+                else:
+                    aes_ties += 1
         except Exception as e:
             print(f"[WARN] AES scoring failed: {e}")
     # HPS (may be None if model not available)
@@ -116,6 +147,16 @@ for p in example_prompts:
                 if i < len(hps_sums):
                     hps_sums[i] += float(s)
                     hps_counts[i] += 1
+            # Win/Loss/Tie for HPS
+            if len(hps_scores) >= 2:
+                base_hps = float(hps_scores[0])
+                dpo_hps = float(hps_scores[1])
+                if dpo_hps > base_hps + 1e-8:
+                    hps_wins += 1
+                elif base_hps > dpo_hps + 1e-8:
+                    hps_losses += 1
+                else:
+                    hps_ties += 1
         except Exception as e:
             print(f"[WARN] HPS scoring failed: {e}")
 
@@ -137,6 +178,22 @@ if hps_sums is not None:
     print(f"HPS mean - {labels[0]}: {fmt_mean(hps_sums, hps_counts, 0)}, {labels[1]}: {fmt_mean(hps_sums, hps_counts, 1)}")
 else:
     print("HPS mean - skipped (HPS selector unavailable)")
+
+# Print win rates across prompts (DPO vs Orig.)
+def fmt_winrate(wins, losses):
+    total = (wins or 0) + (losses or 0)
+    return (wins / total) if total > 0 else None
+
+print("\n==== Win rates (DPO vs Orig.) ====")
+print(f"PickScore win-rate: {fmt_winrate(ps_wins, ps_losses)} (wins={ps_wins}, losses={ps_losses}, ties={ps_ties})")
+if aes_sums is not None:
+    print(f"AES win-rate: {fmt_winrate(aes_wins, aes_losses)} (wins={aes_wins}, losses={aes_losses}, ties={aes_ties})")
+else:
+    print("AES win-rate - skipped (AES selector unavailable)")
+if hps_sums is not None:
+    print(f"HPS win-rate: {fmt_winrate(hps_wins, hps_losses)} (wins={hps_wins}, losses={hps_losses}, ties={hps_ties})")
+else:
+    print("HPS win-rate - skipped (HPS selector unavailable)")
 
 # # to get partiprompts captions
 # from datasets import load_dataset
