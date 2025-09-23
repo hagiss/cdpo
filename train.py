@@ -49,6 +49,8 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
 
+# Conditional SD1.5 adapter (monkey patch 1)
+from cond_sd15 import SD15ConditionAdapter, build_condition_tokens, monkey_patch_sd15_pipeline_for_condition
 
 if is_wandb_available():
     import wandb
@@ -373,6 +375,16 @@ def parse_args():
     parser.add_argument(
         "--dreamlike_pairs_only", action="store_true", help="Only train on pairs where both generations are from dreamlike"
     )
+    # Conditional training/inference (SD1.5)
+    parser.add_argument("--train_method", type=str, default=None, choices=["sft", "dpo", "csft", "cdpo"], help="Training method: sft/dpo/csft/cdpo")
+    parser.add_argument("--csft", action='store_true', help="Alias for --train_method csft")
+    parser.add_argument("--cdpo", action='store_true', help="Alias for --train_method cdpo")
+    parser.add_argument("--cond_projector_type", type=str, default="linear", choices=["linear", "mlp"], help="Condition adapter projector type")
+    parser.add_argument("--cond_mlp_hidden_dim", type=int, default=2048, help="Hidden dim for MLP projector (if used)")
+    parser.add_argument("--cond_num_tokens", type=int, default=1, help="Number of condition tokens to append")
+    parser.add_argument("--cond_positive_text", type=str, default="win", help="Positive condition text")
+    parser.add_argument("--cond_negative_text", type=str, default="lose", help="Negative condition text")
+    parser.add_argument("--csft_cond_only", action='store_true', help="In CSFT, freeze UNet and train only conditional adapter")
     
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -392,7 +404,15 @@ def parse_args():
         else:
             args.resolution = 512
             
-    args.train_method = 'sft' if args.sft else 'dpo'
+    # Resolve training method
+    if args.train_method is not None:
+        pass
+    elif args.csft:
+        args.train_method = 'csft'
+    elif args.cdpo:
+        args.train_method = 'cdpo'
+    else:
+        args.train_method = 'sft' if args.sft else 'dpo'
     return args
 
 
@@ -601,6 +621,20 @@ def main():
         args.unet_init if args.unet_init else args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
+    # Conditional adapter for SD1.5 (csft/cdpo)
+    cond_adapter = None
+    if (not args.sdxl) and (args.train_method in ["csft", "cdpo"]):
+        try:
+            hidden_size = getattr(text_encoder.config, "hidden_size", 768)
+        except Exception:
+            hidden_size = 768
+        cond_adapter = SD15ConditionAdapter(
+            hidden_size=hidden_size,
+            projector_type=args.cond_projector_type,
+            mlp_hidden_dim=args.cond_mlp_hidden_dim,
+            num_condition_tokens=args.cond_num_tokens,
+        )
+
     # Freeze vae, text_encoder(s), reference unet
     vae.requires_grad_(False)
     if args.sdxl:
@@ -608,7 +642,10 @@ def main():
         text_encoder_two.requires_grad_(False)
     else:
         text_encoder.requires_grad_(False)
-    if args.train_method == 'dpo': ref_unet.requires_grad_(False)
+    if args.train_method in ['dpo', 'cdpo']: ref_unet.requires_grad_(False)
+    # Optionally freeze UNet for CSFT when training only conditional adapter
+    if (args.train_method == 'csft') and args.csft_cond_only:
+        unet.requires_grad_(False)
 
     # xformers efficient attention
     if is_xformers_available():
@@ -616,7 +653,7 @@ def main():
 
         xformers_version = version.parse(xformers.__version__)
         if xformers_version == version.parse("0.0.16"):
-            logger.warn(
+            logger.warning(
                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
             )
         unet.enable_xformers_memory_efficient_attention()
@@ -630,31 +667,32 @@ def main():
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
-            
-            if len(models) > 1:
-                assert args.train_method == 'dpo' # 2nd model is just ref_unet in DPO case
-            models_to_save = models[:1]
-            for i, model in enumerate(models_to_save):
-                model.save_pretrained(os.path.join(output_dir, "unet"))
-
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
+            # Save UNet and optional conditional adapter. Unwrap to handle DDP/FSDP wrappers.
+            for model in list(models):
+                unwrapped = accelerator.unwrap_model(model)
+                if isinstance(unwrapped, UNet2DConditionModel):
+                    unwrapped.save_pretrained(os.path.join(output_dir, "unet"))
+                elif isinstance(unwrapped, SD15ConditionAdapter):
+                    unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
+                if len(weights) > 0:
+                    weights.pop()
 
         def load_model_hook(models, input_dir):
-
-            if len(models) > 1:
-                assert args.train_method == 'dpo' # 2nd model is just ref_unet in DPO case
-            models_to_load = models[:1]
-            for i in range(len(models_to_load)):
-                # pop models so that they are not loaded again
+            # Pop models to signal we've handled loading. Unwrap to access real modules.
+            for _ in range(len(models)):
                 model = models.pop()
-
-                # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                unwrapped = accelerator.unwrap_model(model)
+                if isinstance(unwrapped, UNet2DConditionModel):
+                    load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                    unwrapped.register_to_config(**load_model.config)
+                    unwrapped.load_state_dict(load_model.state_dict())
+                    del load_model
+                elif isinstance(unwrapped, SD15ConditionAdapter):
+                    try:
+                        load_adapter = SD15ConditionAdapter.from_pretrained(os.path.join(input_dir, "cond_adapter"))
+                        unwrapped.load_state_dict(load_adapter.state_dict())
+                    except Exception:
+                        pass
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -674,9 +712,16 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
+    # Build optimizer parameters (optionally exclude UNet if csft_cond_only)
+    optim_params = []
+    if not ((args.train_method == 'csft') and args.csft_cond_only):
+        optim_params += list(unet.parameters())
+    if cond_adapter is not None:
+        optim_params += list(cond_adapter.parameters())
+
     if args.use_adafactor or args.sdxl:
         print("Using Adafactor either because you asked for it or you're using SDXL")
-        optimizer = transformers.Adafactor(unet.parameters(),
+        optimizer = transformers.Adafactor(optim_params,
                                            lr=args.learning_rate,
                                            weight_decay=args.adam_weight_decay,
                                            clip_threshold=1.0,
@@ -684,7 +729,7 @@ def main():
                                           relative_step=False)
     else:
         optimizer = torch.optim.AdamW(
-            unet.parameters(),
+            optim_params,
             lr=args.learning_rate,
             betas=(args.adam_beta1, args.adam_beta2),
             weight_decay=args.adam_weight_decay,
@@ -722,7 +767,9 @@ def main():
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if 'pickapic' in args.dataset_name or (args.train_method == 'dpo'):
+    # Pairwise or conditional datasets don't require a single image_column. This includes Pick-a-Pic and MVV Full.
+    if (args.dataset_name and (('pickapic' in args.dataset_name) or ('mvv_full' in args.dataset_name))) or (args.train_method in ['dpo', 'cdpo', 'csft']):
+        # Pairwise or conditional modes don't require a single image_column
         pass
     elif args.image_column is None:
         image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -777,7 +824,7 @@ def main():
     ##### START BIG OLD DATASET BLOCK #####
     
     #### START PREPROCESSING/COLLATION ####
-    if args.train_method == 'dpo':
+    if args.train_method in ['dpo', 'cdpo']:
         print("Ignoring image_column variable, reading from jpg_0 and jpg_1")
         def preprocess_train(examples):
             all_pixel_values = []
@@ -808,6 +855,11 @@ def main():
                 return_d["caption"] = [example["caption"] for example in examples]
             else:
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
+            if args.train_method == 'cdpo':
+                conds = []
+                for _ in examples:
+                    conds.append(args.cond_positive_text if random.random() < 0.5 else args.cond_negative_text)
+                return_d["cond_texts"] = conds
                 
             if args.choice_model:
                 # If using AIF then deliver image data for choice model to determine if should flip pixel values
@@ -858,6 +910,48 @@ def main():
                 return_d["caption"] = [example["caption"] for example in examples]
             else:
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
+            return return_d
+    elif args.train_method == 'csft':
+        def preprocess_train(examples):
+            win_images = []
+            lose_images = []
+            captions = []
+            if 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
+                for im_0_bytes, im_1_bytes, label_0, cap in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption']):
+                    assert label_0 in (0, 1)
+                    im_win_bytes = im_0_bytes if label_0==1 else im_1_bytes
+                    im_lose_bytes = im_1_bytes if label_0==1 else im_0_bytes
+                    win_images.append(Image.open(io.BytesIO(im_win_bytes)).convert("RGB"))
+                    lose_images.append(Image.open(io.BytesIO(im_lose_bytes)).convert("RGB"))
+                    captions.append(cap)
+            else:
+                # Fallback: single image datasets, treat image as win and duplicate as lose
+                for image, cap in zip(examples[image_column], examples[caption_column]):
+                    img = image.convert("RGB")
+                    win_images.append(img)
+                    lose_images.append(img)
+                    captions.append(cap)
+            examples["pixel_values_win"] = [train_transforms(img) for img in win_images]
+            examples["pixel_values_lose"] = [train_transforms(img) for img in lose_images]
+            if not args.sdxl: examples["input_ids"] = tokenize_captions({caption_column: captions})
+            else: examples["caption"] = captions
+            return examples
+
+        def collate_fn(examples):
+            win = torch.stack([ex["pixel_values_win"] for ex in examples])
+            lose = torch.stack([ex["pixel_values_lose"] for ex in examples])
+            pixel_values = torch.cat([win, lose], dim=0)
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            return_d = {"pixel_values": pixel_values}
+            if args.sdxl:
+                caps = [ex["caption"] for ex in examples]
+                return_d["caption"] = caps + caps
+            else:
+                ids = torch.stack([ex["input_ids"] for ex in examples])
+                return_d["input_ids"] = torch.cat([ids, ids], dim=0)
+            # Provide aligned condition texts: first half positive, second half negative
+            conds = [args.cond_positive_text for _ in examples] + [args.cond_negative_text for _ in examples]
+            return_d["cond_texts"] = conds
             return return_d
     #### END PREPROCESSING/COLLATION ####
     
@@ -919,9 +1013,14 @@ def main():
 
     
     #### START ACCELERATOR PREP ####
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
+    if cond_adapter is not None:
+        unet, cond_adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, cond_adapter, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler
+        )
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -944,14 +1043,16 @@ def main():
         print("Offloading text encoders to cpu")
         text_encoder_one = accelerate.cpu_offload(text_encoder_one)
         text_encoder_two = accelerate.cpu_offload(text_encoder_two)
-        if args.train_method == 'dpo':
+        if args.train_method in ['dpo', 'cdpo']:
             ref_unet.to(accelerator.device, dtype=weight_dtype)
             print("offload ref_unet")
             ref_unet = accelerate.cpu_offload(ref_unet)
     else:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-        if args.train_method == 'dpo':
+        if args.train_method in ['dpo', 'cdpo']:
             ref_unet.to(accelerator.device, dtype=weight_dtype)
+        if cond_adapter is not None:
+            cond_adapter.to(accelerator.device)
     ### END ACCELERATOR PREP ###
     
     
@@ -992,6 +1093,17 @@ def main():
                     revision=args.revision,
                     torch_dtype=unet_dtype,
                 )
+                # Apply conditional monkey patch for SD1.5 during training sampling
+                if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]):
+                    try:
+                        monkey_patch_sd15_pipeline_for_condition(
+                            sample_pipe_local,
+                            cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module,
+                            positive_condition=args.cond_positive_text,
+                            negative_condition=args.cond_negative_text,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Conditional CFG monkey-patch failed; proceeding to sample without conditional tokens. Error: {e}")
             # swap in current training UNet
             sample_pipe_local.unet = unet_infer
             try:
@@ -1031,17 +1143,19 @@ def main():
                     guidance_scale=SAMPLE_GUIDANCE_SCALE,
                     generator=_gen,
                 ).images
-        try:
-            if is_wandb_available():
-                wandb_images = [wandb.Image(img) for img in images]
-                accelerator.log({"samples": wandb_images}, step=0)
-            else:
-                out_dir = os.path.join(args.output_dir, "samples")
-                os.makedirs(out_dir, exist_ok=True)
-                for idx, img in enumerate(images):
-                    img.save(os.path.join(out_dir, f"step000000_{idx}.png"))
-        except Exception as e:
-            logger.warn(f"Failed to log pre-training samples: {e}")
+            
+            # Log list of images to trackers (e.g., W&B)
+            try:
+                if is_wandb_available():
+                    wandb_images = [wandb.Image(img) for img in images]
+                    accelerator.log({"samples": wandb_images}, step=0)
+                else:
+                    out_dir = os.path.join(args.output_dir, "samples")
+                    os.makedirs(out_dir, exist_ok=True)
+                    for idx, img in enumerate(images):
+                        img.save(os.path.join(out_dir, f"step000000_{idx}.png"))
+            except Exception as e:
+                logger.warning(f"Failed to log pre-training samples: {e}")
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1101,15 +1215,23 @@ def main():
                 continue
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                if args.train_method == 'dpo':
+                if args.train_method in ['dpo', 'cdpo']:
                     # y_w and y_l were concatenated along channel dimension
-                    feed_pixel_values = torch.cat(batch["pixel_values"].chunk(2, dim=1))
-                    # If using AIF then we haven't ranked yet so do so now
-                    # Only implemented for BS=1 (assert-protected)
+                    winners, losers = batch["pixel_values"].chunk(2, dim=1)
+                    # If using AIF/choice model, determine winners/losers by the selector
                     if args.choice_model:
                         if choice_model_says_flip(batch):
-                            feed_pixel_values = feed_pixel_values.flip(0)
-                elif args.train_method == 'sft':
+                            winners, losers = losers, winners
+                    if args.train_method == 'dpo':
+                        feed_pixel_values = torch.cat([winners, losers], dim=0)
+                    else:
+                        # Conditional DPO: condition selects preferred side
+                        conds = batch.get("cond_texts", [args.cond_positive_text] * winners.shape[0])
+                        cond_is_win = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], device=winners.device).view(-1, 1, 1, 1)
+                        first = torch.where(cond_is_win == 1, winners, losers)
+                        second = torch.where(cond_is_win == 1, losers, winners)
+                        feed_pixel_values = torch.cat([first, second], dim=0)
+                elif args.train_method in ['sft', 'csft']:
                     feed_pixel_values = batch["pixel_values"]
                 
                 #### Diffusion Stuff ####
@@ -1140,7 +1262,7 @@ def main():
                     timesteps_0_to_3 = timesteps % 4
                     timesteps = 250 * timesteps_0_to_3 + 249
                 
-                if args.train_method == 'dpo': # make timesteps and noise same for pairs in DPO
+                if args.train_method in ['dpo', 'cdpo']: # make timesteps and noise same for pairs in DPO/CDPO
                     timesteps = timesteps.chunk(2)[0].repeat(2)
                     noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
 
@@ -1180,16 +1302,31 @@ def main():
                                                           caption_column='caption',
                                                            is_train=True,
                                                           )
-                    if args.train_method == 'dpo':
+                    if args.train_method in ['dpo', 'cdpo']:
                         prompt_batch["prompt_embeds"] = prompt_batch["prompt_embeds"].repeat(2, 1, 1)
                         prompt_batch["pooled_prompt_embeds"] = prompt_batch["pooled_prompt_embeds"].repeat(2, 1)
                     unet_added_conditions = {"time_ids": add_time_ids,
                                             "text_embeds": prompt_batch["pooled_prompt_embeds"]}
                 else: # sd1.5
                     # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                    if args.train_method == 'dpo':
-                        encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
+                    if args.train_method in ['csft']:
+                        # Already flattened to 2*B in collate
+                        encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    else:
+                        encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                        if args.train_method in ['dpo', 'cdpo']:
+                            encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
+                    # Append condition tokens if conditional methods
+                    if cond_adapter is not None and args.train_method in ['csft', 'cdpo']:
+                        if args.train_method == 'cdpo':
+                            cond_texts = batch.get("cond_texts", [args.cond_positive_text] * (encoder_hidden_states.shape[0] // 2))
+                            # Build once for B, then repeat to 2B to align with encoder_hidden_states
+                            cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                            cond_tokens = cond_tokens.repeat(2, 1, 1)
+                        else:  # csft (already 2*B)
+                            cond_texts = batch["cond_texts"]
+                            cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                        encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
                 #### END PREP BATCH ####
                         
                 assert noise_scheduler.config.prediction_type == "epsilon"
@@ -1206,9 +1343,9 @@ def main():
                                   added_cond_kwargs = added_cond_kwargs
                                  ).sample
                 #### START LOSS COMPUTATION ####
-                if args.train_method == 'sft': # SFT, casting for F.mse_loss
+                if args.train_method in ['sft', 'csft']: # SFT/CSFT, casting for F.mse_loss
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                elif args.train_method == 'dpo':
+                elif args.train_method in ['dpo', 'cdpo']:
                     # model_pred and ref_pred will be (2 * LBS) x 4 x latent_spatial_dim x latent_spatial_dim
                     # losses are both 2 * LBS
                     # 1st half of tensors is preferred (y_w), second half is unpreferred
@@ -1241,7 +1378,7 @@ def main():
                 # Also gather:
                 # - model MSE vs reference MSE (useful to observe divergent behavior)
                 # - Implicit accuracy
-                if args.train_method == 'dpo':
+                if args.train_method in ['dpo', 'cdpo']:
                     avg_model_mse = accelerator.gather(raw_model_loss.repeat(args.train_batch_size)).mean().item()
                     avg_ref_mse = accelerator.gather(raw_ref_loss.repeat(args.train_batch_size)).mean().item()
                     avg_acc = accelerator.gather(implicit_acc).mean().item()
@@ -1251,7 +1388,10 @@ def main():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     if not args.use_adafactor: # Adafactor does itself, maybe could do here to cut down on code
-                        accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                        # Clip only trainable params; if csft_cond_only, UNet may be frozen
+                        trainable_params = [p for p in unet.parameters() if p.requires_grad]
+                        if len(trainable_params) > 0:
+                            accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1261,7 +1401,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                if args.train_method == 'dpo':
+                if args.train_method in ['dpo', 'cdpo']:
                     accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
                     accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
                     accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
@@ -1275,6 +1415,10 @@ def main():
                     try:
                         _unet_chk = next(accelerator.unwrap_model(unet).parameters()).detach().float()
                         accelerator.log({"unet_first_weight_mean": _unet_chk.mean().item()}, step=global_step)
+
+                        if args.train_method in ['csft', 'cdpo']:
+                            cond_adapter_chk = next(accelerator.unwrap_model(cond_adapter).parameters()).detach().float()
+                            accelerator.log({"cond_adapter_first_weight_mean": cond_adapter_chk.mean().item()}, step=global_step)
                     except Exception:
                         pass
                     with torch.inference_mode():
@@ -1305,7 +1449,7 @@ def main():
                             for idx, img in enumerate(images):
                                 img.save(os.path.join(out_dir, f"step{global_step:06d}_{idx}.png"))
                     except Exception as e:
-                        logger.warn(f"Failed to log samples at step {global_step}: {e}")
+                        logger.warning(f"Failed to log samples at step {global_step}: {e}")
 
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -1315,7 +1459,7 @@ def main():
                         logger.info("Pretty sure saving/loading is fixed but proceed cautiously")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            if args.train_method == 'dpo':
+            if args.train_method in ['dpo', 'cdpo']:
                 logs["implicit_acc"] = avg_acc
             progress_bar.set_postfix(**logs)
 
@@ -1349,6 +1493,13 @@ def main():
                 revision=args.revision,
             )
         pipeline.save_pretrained(args.output_dir)
+        # Save conditional adapter alongside pipeline for SD1.5 conditional methods
+        if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]):
+            try:
+                ca = accelerator.unwrap_model(cond_adapter)
+            except Exception:
+                ca = cond_adapter
+            ca.save_pretrained(os.path.join(args.output_dir, "cond_adapter"))
 
 
     accelerator.end_training()

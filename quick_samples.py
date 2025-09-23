@@ -1,31 +1,28 @@
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel, StableDiffusionXLPipeline
+from cond_sd15 import SD15ConditionAdapter, monkey_patch_sd15_pipeline_for_condition
 import torch
 torch.set_grad_enabled(False)
 
-dpo_unet = UNet2DConditionModel.from_pretrained(
-                            #  'mhdang/dpo-sd1.5-text2image-v1',
-                            # 'mhdang/dpo-sdxl-text2image-v1',
-                            "tmp-sd15-fixlabel/checkpoint-300",
-                            # alternatively use local ckptdir (*/checkpoint-n/)
-                            subfolder='unet',
-                            torch_dtype=torch.float16
-).to('cuda')
+ckpt_path = "tmp-sd15-csft-500steps-condonly-mlp/checkpoint-500"
 
 # pretrained_model_name = "CompVis/stable-diffusion-v1-4"
 pretrained_model_name = "runwayml/stable-diffusion-v1-5"
 # pretrained_model_name = "stabilityai/stable-diffusion-xl-base-1.0"
-gs = (5 if 'stable-diffusion-xl' in pretrained_model_name else 7.5)
+gs = (3.5 if 'stable-diffusion-xl' in pretrained_model_name else 7.5)
 
+# --------------------
+# Build baseline pipeline (UNPATCHED)
+# --------------------
 if 'stable-diffusion-xl' in pretrained_model_name:
-    pipe = StableDiffusionXLPipeline.from_pretrained(
+    pipe_base = StableDiffusionXLPipeline.from_pretrained(
         pretrained_model_name, torch_dtype=torch.float16,
         variant="fp16", use_safetensors=True
     ).to("cuda")
 else:
-    pipe = StableDiffusionPipeline.from_pretrained(pretrained_model_name,
-                                                   torch_dtype=torch.float16)
-pipe = pipe.to('cuda')
-pipe.safety_checker = None # Trigger-happy, blacks out >50% of "robot tiger"
+    pipe_base = StableDiffusionPipeline.from_pretrained(pretrained_model_name,
+                                                        torch_dtype=torch.float16)
+pipe_base = pipe_base.to('cuda')
+pipe_base.safety_checker = None  # Trigger-happy, blacks out >50% of "robot tiger"
 
 # Can do clip_utils, aes_utils, hps_utils
 from utils.pickscore_utils import Selector as PickSelector
@@ -44,20 +41,13 @@ except Exception as e:
     hps_selector = None
     print(f"[WARN] HPS selector unavailable: {e}")
 
-unets = [pipe.unet, dpo_unet]
 names = ["Orig.", "DPO"]
 
-def gen(prompt, seed=0, run_baseline=True):
-    ims = []
+def generate_image(pipe, prompt, seed=0):
     generator = torch.Generator(device='cuda')
-    for unet_i in ([0, 1] if run_baseline else [1]):
-        print(f"Prompt: {prompt}\nSeed: {seed}\n{names[unet_i]}")
-        pipe.unet = unets[unet_i]
-        generator = generator.manual_seed(seed)
-        
-        im = pipe(prompt=prompt, generator=generator, guidance_scale=gs).images[0]
-        ims.append(im)
-    return ims
+    generator = generator.manual_seed(seed)
+    im = pipe(prompt=prompt, generator=generator, guidance_scale=gs).images[0]
+    return im
 
 example_prompts = [
     "A pile of sand swirling in the wind forming the shape of a dancer",
@@ -98,8 +88,56 @@ hps_wins = 0 if hps_selector is not None else None
 hps_losses = 0 if hps_selector is not None else None
 hps_ties = 0 if hps_selector is not None else None
 
+# --------------------
+# Phase 1: Baseline inference for all prompts (no monkey patch)
+# --------------------
+seed = 0
+baseline_images = []
 for p in example_prompts:
-    ims = gen(p) # could save these if desired    
+    print(f"Prompt: {p}\nSeed: {seed}\n{names[0]}")
+    im_base = generate_image(pipe_base, p, seed=seed)
+    baseline_images.append(im_base)
+
+# --------------------
+# Phase 2: Load trained weights, monkey-patch a NEW pipeline, then infer
+# --------------------
+print("\n[INFO] Loading trained UNet and patching second pipeline for conditioned CFG...")
+dpo_unet = UNet2DConditionModel.from_pretrained(
+                            ckpt_path,
+                            subfolder='unet',
+                            torch_dtype=torch.float16
+).to('cuda')
+
+if 'stable-diffusion-xl' in pretrained_model_name:
+    pipe_dpo = StableDiffusionXLPipeline.from_pretrained(
+        pretrained_model_name, torch_dtype=torch.float16,
+        variant="fp16", use_safetensors=True
+    ).to("cuda")
+else:
+    pipe_dpo = StableDiffusionPipeline.from_pretrained(pretrained_model_name,
+                                                       torch_dtype=torch.float16)
+pipe_dpo = pipe_dpo.to('cuda')
+pipe_dpo.safety_checker = None
+pipe_dpo.unet = dpo_unet
+
+try:
+    cond_adapter = SD15ConditionAdapter.from_pretrained(f"{ckpt_path}/cond_adapter").to('cuda')
+    monkey_patch_sd15_pipeline_for_condition(
+        pipe_dpo,
+        cond_adapter,
+        positive_condition="win",
+        negative_condition="lose",
+    )
+    print("[INFO] Conditional adapter loaded and second pipeline patched for CFG")
+except Exception as e:
+    print(f"Failed to load/patch conditional adapter: {e}")
+
+# Now run DPO inference and compare with baseline
+for idx, p in enumerate(example_prompts):
+    print(f"Prompt: {p}\nSeed: {seed}\n{names[1]}")
+    im_dpo = generate_image(pipe_dpo, p, seed=seed)
+    ims = [baseline_images[idx], im_dpo]
+
     # PickScore
     ps_scores = ps_selector.score(ims, p)
     print("PickScore:", ps_scores)
@@ -117,6 +155,7 @@ for p in example_prompts:
             ps_losses += 1
         else:
             ps_ties += 1
+
     # Aesthetics (may be None if model not available)
     if aes_selector is not None:
         try:
@@ -138,6 +177,7 @@ for p in example_prompts:
                     aes_ties += 1
         except Exception as e:
             print(f"[WARN] AES scoring failed: {e}")
+
     # HPS (may be None if model not available)
     if hps_selector is not None:
         try:
