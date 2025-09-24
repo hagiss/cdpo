@@ -50,7 +50,7 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available, ma
 from diffusers.utils.import_utils import is_xformers_available
 
 # Conditional SD1.5 adapter (monkey patch 1)
-from cond_sd15 import SD15ConditionAdapter, build_condition_tokens, monkey_patch_sd15_pipeline_for_condition
+from cond_sd15 import SD15ConditionAdapter, monkey_patch_sd15_pipeline_for_condition
 
 if is_wandb_available():
     import wandb
@@ -73,8 +73,8 @@ logger = get_logger(__name__, log_level="INFO")
 
 DATASET_NAME_MAPPING = {
     "yuvalkirstain/pickapic_v1": ("jpg_0", "jpg_1", "label_0", "caption"),
-    "yuvalkirstain/pickapic_v2": ("jpg_0", "jpg_1", "label_0", "caption"),
-    "hagiss/mvv_full": ("jpg_0", "jpg_1", "label_0", "caption", "prompt", 'mps_probs', 'vqa_scores', 'vila_scores'),
+    "yuvalkirstain/pickapic_v2": ("jpg_0", "jpg_1", "label_0", "caption"), # label_0 is 1 means jpg_0 wins
+    "hagiss/mvv_full": ("jpg_0", "jpg_1", "label_0", "caption", "prompt", 'mps_probs', 'vqa_scores', 'vila_scores'), # label_0 is 0 means jpg_0 wins
 }
 
 # Fixed sample prompts for qualitative monitoring during training
@@ -380,11 +380,22 @@ def parse_args():
     parser.add_argument("--csft", action='store_true', help="Alias for --train_method csft")
     parser.add_argument("--cdpo", action='store_true', help="Alias for --train_method cdpo")
     parser.add_argument("--cond_projector_type", type=str, default="linear", choices=["linear", "mlp"], help="Condition adapter projector type")
-    parser.add_argument("--cond_mlp_hidden_dim", type=int, default=2048, help="Hidden dim for MLP projector (if used)")
+    parser.add_argument("--cond_mlp_hidden_dim", type=int, default=4096, help="Hidden dim for MLP projector (if used)")
     parser.add_argument("--cond_num_tokens", type=int, default=1, help="Number of condition tokens to append")
     parser.add_argument("--cond_positive_text", type=str, default="win", help="Positive condition text")
     parser.add_argument("--cond_negative_text", type=str, default="lose", help="Negative condition text")
     parser.add_argument("--csft_cond_only", action='store_true', help="In CSFT, freeze UNet and train only conditional adapter")
+    # Initialize conditional adapter from a previous run (e.g., trained with --csft_cond_only)
+    parser.add_argument(
+        "--cond_adapter_init",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pretrained conditional adapter directory to initialize from. "
+            "Can point directly to the adapter folder containing config.json & pytorch_model.bin, "
+            "or to a parent directory that contains a 'cond_adapter' subfolder."
+        ),
+    )
     
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -634,6 +645,20 @@ def main():
             mlp_hidden_dim=args.cond_mlp_hidden_dim,
             num_condition_tokens=args.cond_num_tokens,
         )
+
+        # Optionally initialize from a pretrained conditional adapter on disk
+        if args.cond_adapter_init:
+            load_dir = args.cond_adapter_init
+            candidate = os.path.join(load_dir, "cond_adapter")
+            if os.path.isdir(candidate):
+                load_dir = candidate
+            try:
+                loaded_adapter = SD15ConditionAdapter.from_pretrained(load_dir)
+                cond_adapter = loaded_adapter
+                print(f"Initialized conditional adapter from '{load_dir}'")
+            except Exception as e:
+                logger.warning(f"Failed to initialize conditional adapter from '{load_dir}': {e}")
+            exit()
 
     # Freeze vae, text_encoder(s), reference unet
     vae.requires_grad_(False)
@@ -1321,11 +1346,16 @@ def main():
                         if args.train_method == 'cdpo':
                             cond_texts = batch.get("cond_texts", [args.cond_positive_text] * (encoder_hidden_states.shape[0] // 2))
                             # Build once for B, then repeat to 2B to align with encoder_hidden_states
-                            cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                            # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                            # cond_tokens = cond_tokens.repeat(2, 1, 1)
+                            cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
+                            cond_tokens = cond_adapter(cond_tokens)
                             cond_tokens = cond_tokens.repeat(2, 1, 1)
                         else:  # csft (already 2*B)
                             cond_texts = batch["cond_texts"]
-                            cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                            # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
+                            cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
+                            cond_tokens = cond_adapter(cond_tokens)
                         encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
                 #### END PREP BATCH ####
                         
