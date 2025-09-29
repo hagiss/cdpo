@@ -50,7 +50,7 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available, ma
 from diffusers.utils.import_utils import is_xformers_available
 
 # Conditional SD1.5 adapter (monkey patch 1)
-from cond_sd15 import SD15ConditionAdapter, monkey_patch_sd15_pipeline_for_condition
+from cond_sd15 import SD15ConditionAdapter, monkey_patch_sd15_pipeline_for_condition, monkey_patch_sd15_pipeline_for_ipadapter, IPAdapter, init_adapter
 
 if is_wandb_available():
     import wandb
@@ -381,10 +381,15 @@ def parse_args():
     parser.add_argument("--cdpo", action='store_true', help="Alias for --train_method cdpo")
     parser.add_argument("--cond_projector_type", type=str, default="linear", choices=["linear", "mlp"], help="Condition adapter projector type")
     parser.add_argument("--cond_mlp_hidden_dim", type=int, default=4096, help="Hidden dim for MLP projector (if used)")
-    parser.add_argument("--cond_num_tokens", type=int, default=1, help="Number of condition tokens to append")
+    parser.add_argument("--cond_num_tokens", type=int, default=1, help="Deprecated")
     parser.add_argument("--cond_positive_text", type=str, default="win", help="Positive condition text")
     parser.add_argument("--cond_negative_text", type=str, default="lose", help="Negative condition text")
     parser.add_argument("--csft_cond_only", action='store_true', help="In CSFT, freeze UNet and train only conditional adapter")
+    parser.add_argument("--ip_adapter", action='store_true', help="Use IP adapter")
+    parser.add_argument("--ip_adapter_ckpt", type=str, default=None, help="Path to IP adapter checkpoint")
+    parser.add_argument("--simultaneous_conditioning", action='store_true', help="Use simultaneous conditioning")
+    parser.add_argument("--jeremy_conditioning", action='store_true', help="Use Jeremy conditioning")
+    parser.add_argument("--class_conditioning", action='store_true', help="Add learned class embeddings for win/lose conditions")
     # Initialize conditional adapter from a previous run (e.g., trained with --csft_cond_only)
     parser.add_argument(
         "--cond_adapter_init",
@@ -485,6 +490,9 @@ def main():
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[
+            accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
+        ],
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -658,7 +666,6 @@ def main():
                 print(f"Initialized conditional adapter from '{load_dir}'")
             except Exception as e:
                 logger.warning(f"Failed to initialize conditional adapter from '{load_dir}': {e}")
-            exit()
 
     # Freeze vae, text_encoder(s), reference unet
     vae.requires_grad_(False)
@@ -667,10 +674,37 @@ def main():
         text_encoder_two.requires_grad_(False)
     else:
         text_encoder.requires_grad_(False)
-    if args.train_method in ['dpo', 'cdpo']: ref_unet.requires_grad_(False)
     # Optionally freeze UNet for CSFT when training only conditional adapter
-    if (args.train_method == 'csft') and args.csft_cond_only:
+    if args.csft_cond_only:
         unet.requires_grad_(False)
+
+    if args.ip_adapter:
+        adapter_modules = init_adapter(unet)
+        unet = IPAdapter(unet, cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module, adapter_modules, args.ip_adapter_ckpt)
+
+    if args.train_method in ['dpo', 'cdpo']:
+        if args.train_method == "cdpo":
+            import copy
+            ref_unet = copy.deepcopy(unet)
+        ref_unet.requires_grad_(False)    
+
+    if args.class_conditioning:
+        if args.train_method not in ["csft", "cdpo"]:
+            raise ValueError("class_conditioning is currently supported only for csft/cdpo training methods")
+        if args.simultaneous_conditioning:
+            raise ValueError("class_conditioning is not compatible with simultaneous conditioning")
+        if args.jeremy_conditioning:
+            raise ValueError("class_conditioning is not compatible with jeremy conditioning")
+        try:
+            class_embed_dim = unet.time_embedding.linear_1.out_features
+        except AttributeError:
+            class_embed_dim = getattr(unet.config, "time_embed_dim", None)
+        if class_embed_dim is None:
+            raise ValueError("Unable to determine UNet time embedding dimension for class conditioning")
+        class_embed_layer = torch.nn.Embedding(2, class_embed_dim)
+        torch.nn.init.zeros_(class_embed_layer.weight)
+    else:
+        class_embed_layer = None
 
     # xformers efficient attention
     if is_xformers_available():
@@ -681,7 +715,8 @@ def main():
             logger.warning(
                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
             )
-        unet.enable_xformers_memory_efficient_attention()
+        if not args.ip_adapter:
+            unet.enable_xformers_memory_efficient_attention()
     else:
         raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -699,6 +734,8 @@ def main():
                     unwrapped.save_pretrained(os.path.join(output_dir, "unet"))
                 elif isinstance(unwrapped, SD15ConditionAdapter):
                     unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
+                elif isinstance(unwrapped, IPAdapter):
+                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
                 if len(weights) > 0:
                     weights.pop()
 
@@ -718,6 +755,11 @@ def main():
                         unwrapped.load_state_dict(load_adapter.state_dict())
                     except Exception:
                         pass
+                elif isinstance(unwrapped, IPAdapter):
+                    # load_adapter = IPAdapter.load_from_checkpoint(os.path.join(input_dir, "ip_adapter"))
+                    # unwrapped.load_state_dict(load_adapter.state_dict())
+                    # del load_adapter
+                    print("Loading IPAdapter should be conducted with ip_adapter_ckpt")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -739,10 +781,23 @@ def main():
 
     # Build optimizer parameters (optionally exclude UNet if csft_cond_only)
     optim_params = []
-    if not ((args.train_method == 'csft') and args.csft_cond_only):
+    if not args.csft_cond_only:
         optim_params += list(unet.parameters())
-    if cond_adapter is not None:
-        optim_params += list(cond_adapter.parameters())
+    else:
+        # When using IP-Adapter, we train the adapter on UNet; avoid also including
+        # the separate conditional adapter params which are unused in this mode.
+        if (cond_adapter is not None) and (not args.ip_adapter):
+            optim_params += list(cond_adapter.parameters())
+        if args.ip_adapter and hasattr(unet, "adapter_modules"):
+            for p in unet.adapter_modules.parameters():
+                p.requires_grad = True
+            for p in unet.image_proj_model.parameters():
+                p.requires_grad = True
+            optim_params += list(unet.adapter_modules.parameters()) + list(unet.image_proj_model.parameters())
+
+
+    if class_embed_layer is not None:
+        optim_params += list(class_embed_layer.parameters())
 
     if args.use_adafactor or args.sdxl:
         print("Using Adafactor either because you asked for it or you're using SDXL")
@@ -1038,7 +1093,7 @@ def main():
 
     
     #### START ACCELERATOR PREP ####
-    if cond_adapter is not None:
+    if cond_adapter is not None and not args.ip_adapter:
         unet, cond_adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, cond_adapter, optimizer, train_dataloader, lr_scheduler
         )
@@ -1098,6 +1153,7 @@ def main():
     SAMPLE_EVERY_STEPS = 100
     SAMPLE_INFERENCE_STEPS = 50
     SAMPLE_GUIDANCE_SCALE = 7.5
+    SAMPLE_GUIDANCE_SCALE2 = 4
     sample_pipe = None
     sample_generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
@@ -1121,12 +1177,15 @@ def main():
                 # Apply conditional monkey patch for SD1.5 during training sampling
                 if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]):
                     try:
-                        monkey_patch_sd15_pipeline_for_condition(
-                            sample_pipe_local,
-                            cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module,
-                            positive_condition=args.cond_positive_text,
-                            negative_condition=args.cond_negative_text,
-                        )
+                        if args.ip_adapter:
+                            monkey_patch_sd15_pipeline_for_ipadapter(sample_pipe_local)
+                        else:
+                            monkey_patch_sd15_pipeline_for_condition(
+                                sample_pipe_local,
+                                cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module,
+                                positive_condition=args.cond_positive_text,
+                                negative_condition=args.cond_negative_text,
+                            )
                     except Exception as e:
                         logger.warning(f"Conditional CFG monkey-patch failed; proceeding to sample without conditional tokens. Error: {e}")
             # swap in current training UNet
@@ -1162,18 +1221,68 @@ def main():
                     generator=_gen,
                 ).images
             else:
-                images = sample_pipe(
-                    prompt=SAMPLE_PROMPTS,
-                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
-                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
-                    generator=_gen,
-                ).images
+                try:
+                    if args.ip_adapter:
+                        images = sample_pipe.__call__(
+                            self=sample_pipe,
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                            generator=_gen,
+                            positive_condition=args.cond_positive_text,
+                            negative_condition=args.cond_negative_text,
+                        ).images
+                        images2 = sample_pipe.__call__(
+                            self=sample_pipe,
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=SAMPLE_GUIDANCE_SCALE2,
+                            generator=_gen,
+                            positive_condition=args.cond_positive_text,
+                            negative_condition=args.cond_negative_text,
+                        ).images
+                        images3 = sample_pipe.__call__(
+                            self=sample_pipe,
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=1.0,
+                            generator=_gen,
+                            positive_condition=args.cond_positive_text,
+                            negative_condition=args.cond_negative_text,
+                        ).images
+                    else:
+                        images = sample_pipe(
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                            generator=_gen,
+                        ).images
+                        images2 = sample_pipe(
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=SAMPLE_GUIDANCE_SCALE2,
+                            generator=_gen,
+                        ).images
+                        images3 = sample_pipe(
+                            prompt=SAMPLE_PROMPTS,
+                            num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                            guidance_scale=1.0,
+                            generator=_gen,
+                        ).images
+                except Exception as e:
+                    print(f"Failed to sample images: {e}")
+                    breakpoint()
+
             
             # Log list of images to trackers (e.g., W&B)
             try:
                 if is_wandb_available():
                     wandb_images = [wandb.Image(img) for img in images]
                     accelerator.log({"samples": wandb_images}, step=0)
+                    wandb_images2 = [wandb.Image(img) for img in images2]
+                    accelerator.log({"samples2": wandb_images2}, step=0)
+                    wandb_images3 = [wandb.Image(img) for img in images3]
+                    accelerator.log({"cfg_1": wandb_images3}, step=0)
                 else:
                     out_dir = os.path.join(args.output_dir, "samples")
                     os.makedirs(out_dir, exist_ok=True)
@@ -1250,12 +1359,34 @@ def main():
                     if args.train_method == 'dpo':
                         feed_pixel_values = torch.cat([winners, losers], dim=0)
                     else:
-                        # Conditional DPO: condition selects preferred side
-                        conds = batch.get("cond_texts", [args.cond_positive_text] * winners.shape[0])
-                        cond_is_win = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], device=winners.device).view(-1, 1, 1, 1)
-                        first = torch.where(cond_is_win == 1, winners, losers)
-                        second = torch.where(cond_is_win == 1, losers, winners)
-                        feed_pixel_values = torch.cat([first, second], dim=0)
+                        if args.simultaneous_conditioning:
+                            feed_pixel_values = torch.cat([winners, losers, losers, winners], dim=0)
+                            batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])] + [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                        elif args.jeremy_conditioning:
+                            feed_pixel_values = torch.cat([winners, losers], dim=0)
+                            batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                            null_cond_texts = ["" for _ in range(winners.shape[0])]
+                        else:
+                            # Conditional DPO: condition selects preferred side
+                            conds = batch["cond_texts"]
+                            cond_is_win = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], device=winners.device).view(-1, 1, 1, 1)
+                            first = torch.where(cond_is_win == 1, winners, losers)
+                            second = torch.where(cond_is_win == 1, losers, winners)
+                            feed_pixel_values = torch.cat([first, second], dim=0)
+                            if (step == 0) and (global_step == 0) and accelerator.is_main_process:
+                                debug_entries = []
+                                for idx in range(min(8, winners.shape[0])):
+                                    cond_label = conds[idx] if idx < len(conds) else "<missing>"
+                                    cond_flag = int(cond_is_win[idx].item())
+                                    first_matches_winner = bool(torch.allclose(first[idx], winners[idx]))
+                                    second_matches_loser = bool(torch.allclose(second[idx], losers[idx]))
+                                    debug_entries.append({
+                                        "cond_text": cond_label,
+                                        "cond_is_win": cond_flag,
+                                        "first_is_original_winner": first_matches_winner,
+                                        "second_is_original_loser": second_matches_loser,
+                                    })
+                                accelerator.print(f"[CDPO DEBUG] Batch order check: {debug_entries}")
                 elif args.train_method in ['sft', 'csft']:
                     feed_pixel_values = batch["pixel_values"]
                 
@@ -1290,13 +1421,22 @@ def main():
                 if args.train_method in ['dpo', 'cdpo']: # make timesteps and noise same for pairs in DPO/CDPO
                     timesteps = timesteps.chunk(2)[0].repeat(2)
                     noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
+                    if args.simultaneous_conditioning:
+                        timesteps = timesteps.chunk(4)[0].repeat(4)
+                        noise = noise.chunk(4)[0].repeat(4, 1, 1, 1)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 
+                target_win = target_lose = None
+                jeremy_win_timesteps = jeremy_lose_timesteps = None
+
                 noisy_latents = noise_scheduler.add_noise(latents,
                                                           new_noise if args.input_perturbation else noise,
                                                           timesteps)
+                if args.jeremy_conditioning:
+                    jeremy_win_timesteps, jeremy_lose_timesteps = timesteps.chunk(2)
+                    target_win, target_lose = noise.chunk(2)
                 ### START PREP BATCH ###
                 if args.sdxl:
                     # Get the text embedding for conditioning
@@ -1340,42 +1480,96 @@ def main():
                     else:
                         encoder_hidden_states = text_encoder(batch["input_ids"])[0]
                         if args.train_method in ['dpo', 'cdpo']:
-                            encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
+                            if not args.jeremy_conditioning:
+                                encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
                     # Append condition tokens if conditional methods
-                    if cond_adapter is not None and args.train_method in ['csft', 'cdpo']:
+                    if args.train_method in ['csft', 'cdpo']:
                         if args.train_method == 'cdpo':
-                            cond_texts = batch.get("cond_texts", [args.cond_positive_text] * (encoder_hidden_states.shape[0] // 2))
+                            cond_texts = batch["cond_texts"]
                             # Build once for B, then repeat to 2B to align with encoder_hidden_states
                             # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
                             # cond_tokens = cond_tokens.repeat(2, 1, 1)
                             cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
-                            cond_tokens = cond_adapter(cond_tokens)
-                            cond_tokens = cond_tokens.repeat(2, 1, 1)
+                            if not args.simultaneous_conditioning and not args.jeremy_conditioning:
+                                cond_tokens = cond_tokens.repeat(2, 1, 1)
+                            if args.jeremy_conditioning:
+                                null_cond_tokens = text_encoder(tokenizer(null_cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
                         else:  # csft (already 2*B)
                             cond_texts = batch["cond_texts"]
                             # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
                             cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
-                            cond_tokens = cond_adapter(cond_tokens)
-                        encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
+                            # cond_tokens = cond_adapter(cond_tokens)
+                        # encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
                 #### END PREP BATCH ####
                         
                 assert noise_scheduler.config.prediction_type == "epsilon"
                 target = noise
-               
+                if args.simultaneous_conditioning:
+                    encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
+
+                if args.ip_adapter:
+                    if args.jeremy_conditioning:
+                        # model_pred = unet(
+                        #     noisy_latents,
+                        #     timesteps,
+                        #     encoder_hidden_states, # TODO: only support SD1.5 for now
+                        #     cond_tokens
+                        # )
+                        win_noisy_latent, lose_noisy_latent = noisy_latents.chunk(2)
+                        win_cond_tokens, lose_cond_tokens = cond_tokens.chunk(2)
+                        win_model_pred = unet(
+                            win_noisy_latent,
+                            jeremy_win_timesteps,
+                            encoder_hidden_states,
+                            win_cond_tokens
+                        )
+                        win_model_pred_no_cond = unet(
+                            win_noisy_latent,
+                            jeremy_win_timesteps,
+                            encoder_hidden_states,
+                            null_cond_tokens
+                        )
+                        lose_model_pred = unet(
+                            lose_noisy_latent,
+                            jeremy_lose_timesteps,
+                            encoder_hidden_states,
+                            lose_cond_tokens
+                        )
+                        lose_model_pred_no_cond = unet(
+                            lose_noisy_latent,
+                            jeremy_lose_timesteps,
+                            encoder_hidden_states,
+                            null_cond_tokens
+                        )
+                    else:
+                        model_pred = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states, # TODO: only support SD1.5 for now
+                            cond_tokens
+                        )
+                else:               
                 # Make the prediction from the model we're learning
-                model_batch_args = (noisy_latents,
-                                    timesteps, 
-                                    prompt_batch["prompt_embeds"] if args.sdxl else encoder_hidden_states)
-                added_cond_kwargs = unet_added_conditions if args.sdxl else None
+                    model_batch_args = (noisy_latents,
+                                        timesteps, 
+                                        prompt_batch["prompt_embeds"] if args.sdxl else encoder_hidden_states)
+                    added_cond_kwargs = unet_added_conditions if args.sdxl else None
                 
-                model_pred = unet(
-                                *model_batch_args,
-                                  added_cond_kwargs = added_cond_kwargs
-                                 ).sample
+                    if cond_adapter is not None:
+                        adapter_module = accelerator.unwrap_model(cond_adapter)
+                        adapter_dtype = next(adapter_module.parameters()).dtype
+                        cond_tokens = cond_tokens.to(adapter_dtype)
+                        cond_tokens = cond_adapter(cond_tokens)
+                        cond_tokens = cond_tokens.to(encoder_hidden_states.dtype)
+                        encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
+                    model_pred = unet(
+                                    *model_batch_args,
+                                    added_cond_kwargs = added_cond_kwargs
+                                    ).sample
                 #### START LOSS COMPUTATION ####
                 if args.train_method in ['sft', 'csft']: # SFT/CSFT, casting for F.mse_loss
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                elif args.train_method in ['dpo', 'cdpo']:
+                elif args.train_method in ['dpo']:
                     # model_pred and ref_pred will be (2 * LBS) x 4 x latent_spatial_dim x latent_spatial_dim
                     # losses are both 2 * LBS
                     # 1st half of tensors is preferred (y_w), second half is unpreferred
@@ -1387,10 +1581,17 @@ def main():
                     model_diff = model_losses_w - model_losses_l # These are both LBS (as is t)
                     
                     with torch.no_grad(): # Get the reference policy (unet) prediction
-                        ref_pred = ref_unet(
-                                    *model_batch_args,
-                                      added_cond_kwargs = added_cond_kwargs
-                                     ).sample.detach()
+                        if args.ip_adapter:
+                            ref_pred = ref_unet(
+                                        noisy_latents,
+                                        timesteps,
+                                        encoder_hidden_states, # TODO: only support SD1.5 for now
+                                    ).sample.detach()
+                        else:
+                            ref_pred = ref_unet(
+                                        *model_batch_args,
+                                          added_cond_kwargs = added_cond_kwargs
+                                         ).sample.detach()
                         ref_losses = (ref_pred - target).pow(2).mean(dim=[1,2,3])
                         ref_losses_w, ref_losses_l = ref_losses.chunk(2)
                         ref_diff = ref_losses_w - ref_losses_l
@@ -1400,6 +1601,91 @@ def main():
                     inside_term = scale_term * (model_diff - ref_diff)
                     implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
                     loss = -1 * F.logsigmoid(inside_term).mean()
+                elif args.train_method in ['cdpo']:
+                    # model_pred and ref_pred will be (2 * LBS) x 4 x latent_spatial_dim x latent_spatial_dim
+                    # losses are both 2 * LBS
+                    # 1st half of tensors is preferred (y_w), second half is unpreferred
+                    if args.jeremy_conditioning:
+                        win_cond_losses = (win_model_pred - target_win).pow(2).mean(dim=[1,2,3])
+                        lose_cond_losses = (lose_model_pred - target_lose).pow(2).mean(dim=[1,2,3])
+                        win_no_cond_losses = (win_model_pred_no_cond - target_win).pow(2).mean(dim=[1,2,3])
+                        lose_no_cond_losses = (lose_model_pred_no_cond - target_lose).pow(2).mean(dim=[1,2,3])
+
+                        raw_model_loss = 0.25 * (win_cond_losses.mean() + lose_cond_losses.mean() + win_no_cond_losses.mean() + lose_no_cond_losses.mean())
+
+                        model_diff_w = win_cond_losses - win_no_cond_losses
+                        model_diff_l = lose_cond_losses - lose_no_cond_losses
+                        model_diff = torch.cat([model_diff_w, model_diff_l], dim=0)
+
+                    else:
+                        model_losses = (model_pred - target).pow(2).mean(dim=[1,2,3])
+                        model_losses_w, model_losses_l = model_losses.chunk(2)
+                        # below for logging purposes
+                        raw_model_loss = 0.5 * (model_losses_w.mean() + model_losses_l.mean())
+                        
+                        model_diff = model_losses_w - model_losses_l # These are both LBS (as is t)
+                    
+                    with torch.no_grad(): # Get the reference policy (unet) prediction
+                        if args.ip_adapter:
+                            if args.jeremy_conditioning:
+                                win_ref_pred = ref_unet(
+                                    win_noisy_latent,
+                                    jeremy_win_timesteps,
+                                    encoder_hidden_states, # TODO: only support SD1.5 for now
+                                ).sample.detach()
+                                lose_ref_pred = ref_unet(
+                                    lose_noisy_latent,
+                                    jeremy_lose_timesteps,
+                                    encoder_hidden_states,
+                                ).sample.detach()
+                            else:
+                                if ref_unet.__class__.__name__ == "IPAdapter":
+                                    ref_pred = ref_unet(
+                                        noisy_latents,
+                                        timesteps,
+                                        encoder_hidden_states,
+                                        cond_tokens
+                                    ).detach()
+                                else:
+                                    ref_pred = ref_unet(
+                                                noisy_latents,
+                                                timesteps,
+                                                encoder_hidden_states, # TODO: only support SD1.5 for now
+                                            ).sample.detach()
+                        else:
+                            ref_pred = ref_unet(
+                                        *model_batch_args,
+                                          added_cond_kwargs = added_cond_kwargs
+                                         ).sample.detach()
+                        if args.jeremy_conditioning:
+                            ref_losses_w = (win_ref_pred - target_win).pow(2).mean(dim=[1,2,3])
+                            ref_losses_l = (lose_ref_pred - target_lose).pow(2).mean(dim=[1,2,3])
+                            ref_diff_w = ref_losses_w - ref_losses_w
+                            ref_diff_l = ref_losses_l - ref_losses_l
+                            ref_diff = torch.cat([ref_diff_w, ref_diff_l], dim=0)
+                            raw_ref_loss = 0.5 * (ref_losses_w.mean() + ref_losses_l.mean())
+                        else:
+                            ref_losses = (ref_pred - target).pow(2).mean(dim=[1,2,3])
+                            ref_losses_w, ref_losses_l = ref_losses.chunk(2)
+                            ref_diff = ref_losses_w - ref_losses_l
+                            raw_ref_loss = ref_losses.mean()    
+                    
+                    if args.jeremy_conditioning:
+                        scale_term = -0.5 * args.beta_dpo
+                        win_diff = (win_cond_losses - ref_losses_w).pow(2) - (win_no_cond_losses - ref_losses_w).pow(2)
+                        lose_diff = (lose_cond_losses - ref_losses_l).pow(2) - (lose_no_cond_losses - ref_losses_l).pow(2)
+                        model_diff = torch.cat([win_diff, lose_diff], dim=0)
+                        inside_term = scale_term * model_diff
+                        implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+                        loss = -1 * F.logsigmoid(inside_term).mean()
+                    else:
+                        scale_term = -0.5 * args.beta_dpo
+                        inside_term = scale_term * (model_diff - ref_diff)
+                        # if args.simultaneous_conditioning:
+                        #     bs = inside_term.shape[0]//2
+                        #     inside_term[bs:] *= 0.1
+                        implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
+                        loss = -1 * F.logsigmoid(inside_term).mean()
                 #### END LOSS COMPUTATION ###
                     
                 # Gather the losses across all processes for logging 
@@ -1409,6 +1695,8 @@ def main():
                 # - model MSE vs reference MSE (useful to observe divergent behavior)
                 # - Implicit accuracy
                 if args.train_method in ['dpo', 'cdpo']:
+                    avg_model_lose_mse = accelerator.gather(model_losses_l.repeat(args.train_batch_size)).mean().item()
+                    avg_model_win_mse = accelerator.gather(model_losses_w.repeat(args.train_batch_size)).mean().item()
                     avg_model_mse = accelerator.gather(raw_model_loss.repeat(args.train_batch_size)).mean().item()
                     avg_ref_mse = accelerator.gather(raw_ref_loss.repeat(args.train_batch_size)).mean().item()
                     avg_acc = accelerator.gather(implicit_acc).mean().item()
@@ -1435,6 +1723,8 @@ def main():
                     accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
                     accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
                     accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
+                    accelerator.log({"model_lose_mse_accumulated": avg_model_lose_mse}, step=global_step)
+                    accelerator.log({"model_win_mse_accumulated": avg_model_win_mse}, step=global_step)
                 train_loss = 0.0
                 implicit_acc_accumulated = 0.0
 
@@ -1461,17 +1751,56 @@ def main():
                                 generator=_gen,
                             ).images
                         else:
-                            images = sample_pipe(
-                                prompt=SAMPLE_PROMPTS,
-                                num_inference_steps=SAMPLE_INFERENCE_STEPS,
-                                guidance_scale=SAMPLE_GUIDANCE_SCALE,
-                                generator=_gen,
-                            ).images
+                            if args.ip_adapter:
+                                images = sample_pipe.__call__(
+                                    self=sample_pipe,
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                                    generator=_gen,
+                                    positive_condition=args.cond_positive_text,
+                                    negative_condition=args.cond_negative_text,
+                                ).images
+                                images2 = sample_pipe.__call__(
+                                    self=sample_pipe,
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=SAMPLE_GUIDANCE_SCALE2,
+                                    generator=_gen,
+                                    positive_condition=args.cond_positive_text,
+                                    negative_condition=args.cond_negative_text,
+                                ).images
+                                images3 = sample_pipe.__call__(
+                                    self=sample_pipe,
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=1.0,
+                                    generator=_gen,
+                                    positive_condition=args.cond_positive_text,
+                                    negative_condition=args.cond_negative_text,
+                                ).images
+                            else:
+                                images = sample_pipe(
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                                    generator=_gen,
+                                ).images
+                                images2 = sample_pipe(
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=SAMPLE_GUIDANCE_SCALE2,
+                                    generator=_gen,
+                                ).images
                     # Log list of images to trackers (e.g., W&B)
                     try:
                         if is_wandb_available():
                             wandb_images = [wandb.Image(img) for img in images]
                             accelerator.log({"samples": wandb_images}, step=global_step)
+                            wandb_images2 = [wandb.Image(img) for img in images2]
+                            accelerator.log({"samples2": wandb_images2}, step=global_step)
+                            wandb_images3 = [wandb.Image(img) for img in images3]
+                            accelerator.log({"cfg_1": wandb_images3}, step=global_step)
                         else:
                             # Fallback: save to disk under output_dir/samples
                             out_dir = os.path.join(args.output_dir, "samples")
@@ -1524,7 +1853,7 @@ def main():
             )
         pipeline.save_pretrained(args.output_dir)
         # Save conditional adapter alongside pipeline for SD1.5 conditional methods
-        if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]):
+        if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]) and (not args.ip_adapter):
             try:
                 ca = accelerator.unwrap_model(cond_adapter)
             except Exception:
