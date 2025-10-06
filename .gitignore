@@ -2,3 +2,4 @@ __pycache__/
 
 wandb/
 tmp-sd15*
+outputs/

@@ -85,6 +85,44 @@ SAMPLE_PROMPTS = [
     "A purple raven flying over big sur, light fog, deep focus+closeup, hyper-realistic, volumetric lighting, dramatic lighting, beautiful composition, intricate details, instagram, trending, photograph, film grain and noise, 8K, cinematic, post-production",
 ]
 
+# MAX_MPS = 1.0
+MAX_MPS = 27.53125
+MAX_VQA = 0.9924590587615967
+MAX_VILIA = 0.8928629159927368
+MAX_PICK = 0.2825494408607483
+MAX_AES = 8.049736022949219
+MAX_CLIP = 0.60016268491745
+MAX_HPS = 0.34084761142730713
+
+# MIN_MPS = 0.00015723705291748047
+MIN_MPS = -11.46875
+MIN_VQA = 0.03758121654391289
+MIN_VILIA = 0.23353318870067596
+MIN_PICK = 0.1148335188627243
+MIN_AES = 2.0321502685546875
+MIN_CLIP = -0.14597028493881226
+MIN_HPS = 0.15893374383449554
+
+def normalize_mps(mps):
+    norm = (mps - MIN_MPS) / (MAX_MPS - MIN_MPS)
+    return int(round(norm * 4 + 1))
+
+def normalize_vqa(vqa):
+    norm = (vqa - MIN_VQA) / (MAX_VQA - MIN_VQA)
+    return int(round(norm * 4 + 1))
+
+def normalize_vila(vila):
+    norm = (vila - MIN_VILIA) / (MAX_VILIA - MIN_VILIA)
+    return int(round(norm * 4 + 1))
+
+# def normalize_mps(mps):
+#     return mps
+
+# def normalize_vqa(vqa):
+#     return vqa
+
+# def normalize_vila(vila):
+#     return vila
         
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
@@ -390,6 +428,7 @@ def parse_args():
     parser.add_argument("--simultaneous_conditioning", action='store_true', help="Use simultaneous conditioning")
     parser.add_argument("--jeremy_conditioning", action='store_true', help="Use Jeremy conditioning")
     parser.add_argument("--class_conditioning", action='store_true', help="Add learned class embeddings for win/lose conditions")
+    parser.add_argument("--multi_dim", action='store_true', help="Use multi-dimensional conditioning")
     # Initialize conditional adapter from a previous run (e.g., trained with --csft_cond_only)
     parser.add_argument(
         "--cond_adapter_init",
@@ -916,11 +955,30 @@ def main():
             # Double on channel dim, jpg_y then jpg_w
             im_tup_iterator = zip(*all_pixel_values)
             combined_pixel_values = []
-            for im_tup, label_0 in zip(im_tup_iterator, examples['label_0']):
+            win_mps = []
+            lose_mps = []
+            win_vqa = []
+            lose_vqa = []
+            win_vila = []
+            lose_vila = []
+            for im_tup, label_0, mps_probs, vqa_scores, vila_scores in zip(im_tup_iterator, examples['label_0'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
                 if label_0==0 and (not args.choice_model): # don't want to flip things if using choice_model for AI feedback
                     im_tup = im_tup[::-1]
                 combined_im = torch.cat(im_tup, dim=0) # no batch dim
                 combined_pixel_values.append(combined_im)
+                win_idx = 0 if label_0==1 else 1
+                win_mps.append(normalize_mps(mps_probs[win_idx]))
+                lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
+                win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
+                lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
+                win_vila.append(normalize_vila(vila_scores[win_idx]))
+                lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
+            examples["win_mps_probs"] = win_mps
+            examples["lose_mps_probs"] = lose_mps
+            examples["win_vqa_scores"] = win_vqa
+            examples["lose_vqa_scores"] = lose_vqa
+            examples["win_vila_scores"] = win_vila
+            examples["lose_vila_scores"] = lose_vila
             examples["pixel_values"] = combined_pixel_values
             # SDXL takes raw prompts
             if not args.sdxl: examples["input_ids"] = tokenize_captions(examples)
@@ -936,9 +994,21 @@ def main():
             else:
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
             if args.train_method == 'cdpo':
-                conds = []
-                for _ in examples:
-                    conds.append(args.cond_positive_text if random.random() < 0.5 else args.cond_negative_text)
+                if args.multi_dim:
+                    def cond_text(sample1, sample2):
+                        if sample1 > sample2:
+                            return 'win'
+                        elif sample1 < sample2:
+                            return 'lose'
+                        else:
+                            return 'tie'
+                    conds = [f'win {cond_text(example["win_mps_probs"], example["lose_mps_probs"])} {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples] + [f'lose {cond_text(example["lose_mps_probs"], example["win_mps_probs"])} {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
+                    # conds = [f'win {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples] + [f'lose {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
+                    # print(conds[0], conds[-1])
+                else:
+                    conds = []
+                    for _ in examples:
+                        conds.append(args.cond_positive_text if random.random() < 0.5 else args.cond_negative_text)
                 return_d["cond_texts"] = conds
                 
             if args.choice_model:
@@ -996,14 +1066,27 @@ def main():
             win_images = []
             lose_images = []
             captions = []
+            win_mps = []
+            lose_mps = []
+            win_vqa = []
+            lose_vqa = []
+            win_vila = []
+            lose_vila = []
             if 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
-                for im_0_bytes, im_1_bytes, label_0, cap in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption']):
+                for im_0_bytes, im_1_bytes, label_0, cap, mps_probs, vqa_scores, vila_scores in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
                     assert label_0 in (0, 1)
                     im_win_bytes = im_0_bytes if label_0==1 else im_1_bytes
                     im_lose_bytes = im_1_bytes if label_0==1 else im_0_bytes
                     win_images.append(Image.open(io.BytesIO(im_win_bytes)).convert("RGB"))
                     lose_images.append(Image.open(io.BytesIO(im_lose_bytes)).convert("RGB"))
                     captions.append(cap)
+                    win_idx = 0 if label_0==1 else 1
+                    win_mps.append(normalize_mps(mps_probs[win_idx]))
+                    lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
+                    win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
+                    lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
+                    win_vila.append(normalize_vila(vila_scores[win_idx]))
+                    lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
             else:
                 # Fallback: single image datasets, treat image as win and duplicate as lose
                 for image, cap in zip(examples[image_column], examples[caption_column]):
@@ -1015,6 +1098,13 @@ def main():
             examples["pixel_values_lose"] = [train_transforms(img) for img in lose_images]
             if not args.sdxl: examples["input_ids"] = tokenize_captions({caption_column: captions})
             else: examples["caption"] = captions
+            if args.multi_dim:
+                examples["win_mps_probs"] = win_mps
+                examples["lose_mps_probs"] = lose_mps
+                examples["win_vqa_scores"] = win_vqa
+                examples["lose_vqa_scores"] = lose_vqa
+                examples["win_vila_scores"] = win_vila
+                examples["lose_vila_scores"] = lose_vila
             return examples
 
         def collate_fn(examples):
@@ -1030,7 +1120,19 @@ def main():
                 ids = torch.stack([ex["input_ids"] for ex in examples])
                 return_d["input_ids"] = torch.cat([ids, ids], dim=0)
             # Provide aligned condition texts: first half positive, second half negative
-            conds = [args.cond_positive_text for _ in examples] + [args.cond_negative_text for _ in examples]
+            if args.multi_dim:
+                def cond_text(sample1, sample2):
+                    if sample1 > sample2:
+                        return 'win'
+                    elif sample1 < sample2:
+                        return 'lose'
+                    else:
+                        return 'tie'
+                conds = [f'win {cond_text(ex["win_mps_probs"], ex["lose_mps_probs"])} {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_mps_probs"], ex["win_mps_probs"])} {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
+                # conds = [f'win {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
+                # print(conds[0], conds[-1])
+            else:
+                conds = [args.cond_positive_text for _ in examples] + [args.cond_negative_text for _ in examples]
             return_d["cond_texts"] = conds
             return return_d
     #### END PREPROCESSING/COLLATION ####
@@ -1046,7 +1148,7 @@ def main():
                 new_len = dataset[args.split].num_rows
                 print(f"Dropped {orig_len - new_len}/{orig_len} tie/invalid label examples")
 
-        # Normalize semantics for hagiss/mvv_full: original label_0==0 means jpg_0 wins
+        # Normalize semantics for hagiss/mvv_full: label_0==0 means jpg_0 wins
         if 'hagiss/mvv_full' in args.dataset_name and 'label_0' in dataset[args.split].column_names:
             dataset[args.split] = dataset[args.split].map(lambda example: {'label_0': 1 - example['label_0']})
 
@@ -1361,7 +1463,10 @@ def main():
                     else:
                         if args.simultaneous_conditioning:
                             feed_pixel_values = torch.cat([winners, losers, losers, winners], dim=0)
-                            batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])] + [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                            if args.multi_dim:
+                                batch["cond_texts"] = batch["cond_texts"] + batch["cond_texts"]
+                            else:
+                                batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])] + [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
                         elif args.jeremy_conditioning:
                             feed_pixel_values = torch.cat([winners, losers], dim=0)
                             batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]

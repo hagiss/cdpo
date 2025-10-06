@@ -62,9 +62,9 @@ class SD15ConditionAdapter(nn.Module):
                 nn.Linear(self.mlp_hidden_dim, hidden_size),
             )
             # zero-init the final layer only, so it's a no-op initially
-            # final: nn.Linear = self.projector[-1]  # type: ignore[index]
-            # nn.init.zeros_(final.weight)
-            # nn.init.zeros_(final.bias)
+            final: nn.Linear = self.projector[-1]  # type: ignore[index]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
         else:
             raise ValueError(f"Unsupported projector_type: {projector_type}")
         self.norm = torch.nn.LayerNorm(hidden_size)
@@ -98,10 +98,12 @@ class SD15ConditionAdapter(nn.Module):
         torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
 
     @classmethod
-    def from_pretrained(cls, load_directory: str) -> "SD15ConditionAdapter":
+    def from_pretrained(cls, load_directory: str, projector_type: str = "linear", mlp_hidden_dim: int = 4096) -> "SD15ConditionAdapter":
         with open(os.path.join(load_directory, "config.json"), "r") as f:
             config = json.load(f)
         model = cls(**config)
+        model.projector_type = projector_type
+        model.mlp_hidden_dim = mlp_hidden_dim
         state_dict = torch.load(os.path.join(load_directory, "pytorch_model.bin"), map_location="cpu")
         model.load_state_dict(state_dict)
         return model
@@ -659,8 +661,8 @@ class IPAdapter(torch.nn.Module):
     def __init__(self, unet, image_proj_model, adapter_modules, ckpt_path=None):
         super().__init__()
         self.unet = unet
-        self.image_proj_model = image_proj_model
-        self.adapter_modules = adapter_modules
+        self.image_proj_model = image_proj_model.to(device=unet.device, dtype=unet.dtype)
+        self.adapter_modules = adapter_modules.to(device=unet.device, dtype=unet.dtype)
 
         if ckpt_path is not None:
             self.load_from_checkpoint(ckpt_path)
@@ -686,11 +688,8 @@ class IPAdapter(torch.nn.Module):
         return self.unet.config
 
     def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds=None):
-        if image_embeds is not None:
-            ip_tokens = self.image_proj_model(image_embeds)
-            encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
-        else:
-            ip_tokens = self.image_proj_model(encoder_hidden_states)
+        ip_tokens = self.image_proj_model(image_embeds.to(self.device, dtype=self.dtype))
+        encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
         # Predict the noise residual
         noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
         return noise_pred
@@ -707,31 +706,25 @@ class IPAdapter(torch.nn.Module):
         if os.path.exists(unet_config_path):
             with open(unet_config_path, "r") as f:
                 unet_config_dict = json.load(f)
-            self.unet.config = self.unet.config.__class__.from_dict(unet_config_dict)
-        if os.path.exists(unet_path):
-            unet_state_dict = torch.load(unet_path, map_location="cpu")
-            self.unet.load_state_dict(unet_state_dict)
-
-        # Backwards compatibility with checkpoints saved before the .pt extension was introduced
-        # if not os.path.exists(proj_path):
-        #     legacy_proj_path = os.path.join(ckpt_path, "proj_model")
-        #     if os.path.exists(legacy_proj_path):
-        #         proj_path = legacy_proj_path
-        #     else:
-        #         raise FileNotFoundError(
-        #             f"IP-Adapter projection weights not found at '{proj_path}' or '{legacy_proj_path}'"
-        #         )
-        # if not os.path.exists(adapter_path):
-        #     legacy_adapter_path = os.path.join(ckpt_path, "adapter_modules")
-        #     if os.path.exists(legacy_adapter_path):
-        #         adapter_path = legacy_adapter_path
-        #     else:
-        #         raise FileNotFoundError(
-        #             f"IP-Adapter attention weights not found at '{adapter_path}' or '{legacy_adapter_path}'"
-        #         )
+            # Safely update UNet config without assuming a specific config class API
+            if hasattr(self.unet, "register_to_config"):
+                self.unet.register_to_config(**unet_config_dict)
+            else:
+                try:
+                    # If config is a mutable mapping
+                    self.unet.config.update(unet_config_dict)
+                except Exception:
+                    # As a last resort, reassign plain dict
+                    self.unet.config = unet_config_dict
 
         state_dict_proj = torch.load(proj_path, map_location="cpu")
         state_dict_adapter = torch.load(adapter_path, map_location="cpu")
+
+        if os.path.exists(unet_path):
+            unet_state_dict = torch.load(unet_path, map_location="cpu")
+            # Load UNet weights but allow missing IP-Adapter processor params,
+            # which are stored separately in adapter_modules.pt
+            self.unet.load_state_dict(unet_state_dict, strict=False)
 
         # Load state dict for image_proj_model and adapter_modules
         self.image_proj_model.load_state_dict(state_dict_proj, strict=True)
@@ -844,6 +837,8 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
         guidance_rescale: float = 0.7,
         positive_condition: Optional[str] = None,
         negative_condition: Optional[str] = None,
+        reference_conditional_guidance: Optional[bool] = False,
+        decomposed_additive_guidance: Optional[bool] = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -910,6 +905,10 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                 second element is a list of `bool`s indicating whether the corresponding generated image contains
                 "not-safe-for-work" (nsfw) content.
         """
+
+        if decomposed_additive_guidance:
+            reference_conditional_guidance = False
+
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -942,7 +941,7 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
             device,
             num_images_per_prompt,
             do_classifier_free_guidance,
-            negative_prompt,
+            negative_prompt if not reference_conditional_guidance else prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
@@ -1006,7 +1005,27 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    if decomposed_additive_guidance:
+                        good_cond_embeds, bad_cond_embeds = cond_embeds.chunk(2)
+                        noise_pred_rev = self.unet(
+                            latent_model_input,
+                            t,
+                            prompt_embeds,
+                            torch.cat([bad_cond_embeds, good_cond_embeds], dim=0)
+                        )
+                        null_lose_pred = noise_pred_uncond
+                        text_win_pred = noise_pred_text
+                        null_win_pred, text_lose_pred = noise_pred_rev.chunk(2)
+
+                        null_ref_pred = (null_lose_pred + null_win_pred) / 2
+                        text_ref_pred = (text_win_pred + text_lose_pred) / 2
+                        noise_pred = null_ref_pred + 0.5 * guidance_scale * (text_ref_pred - null_ref_pred) + 0.5 * guidance_scale * (text_win_pred - text_lose_pred)
+                        
+                    elif reference_conditional_guidance:
+                        ref_pred = (noise_pred_uncond + noise_pred_text) / 2
+                        noise_pred = ref_pred + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    else:
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 if do_classifier_free_guidance and guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
