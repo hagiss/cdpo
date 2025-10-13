@@ -89,6 +89,7 @@ SAMPLE_PROMPTS = [
 MAX_MPS = 27.53125
 MAX_VQA = 0.9924590587615967
 MAX_VILIA = 0.8928629159927368
+
 MAX_PICK = 0.2825494408607483
 MAX_AES = 8.049736022949219
 MAX_CLIP = 0.60016268491745
@@ -98,6 +99,7 @@ MAX_HPS = 0.34084761142730713
 MIN_MPS = -11.46875
 MIN_VQA = 0.03758121654391289
 MIN_VILIA = 0.23353318870067596
+
 MIN_PICK = 0.1148335188627243
 MIN_AES = 2.0321502685546875
 MIN_CLIP = -0.14597028493881226
@@ -114,6 +116,22 @@ def normalize_vqa(vqa):
 def normalize_vila(vila):
     norm = (vila - MIN_VILIA) / (MAX_VILIA - MIN_VILIA)
     return int(round(norm * 4 + 1))
+
+def normalize_pick(pick):
+    norm = (pick - MIN_PICK) / (MAX_PICK - MIN_PICK)
+    return int(round(norm * 20 + 1))
+
+def normalize_aes(aes):
+    norm = (aes - MIN_AES) / (MAX_AES - MIN_AES)
+    return int(round(norm * 20 + 1))
+
+def normalize_clip(clip):
+    norm = (clip - MIN_CLIP) / (MAX_CLIP - MIN_CLIP)
+    return int(round(norm * 20 + 1))
+
+def normalize_hps(hps):
+    norm = (hps - MIN_HPS) / (MAX_HPS - MIN_HPS)
+    return int(round(norm * 20 + 1))
 
 # def normalize_mps(mps):
 #     return mps
@@ -412,6 +430,12 @@ def parse_args():
     )
     parser.add_argument(
         "--dreamlike_pairs_only", action="store_true", help="Only train on pairs where both generations are from dreamlike"
+    )
+    parser.add_argument(
+        "--scores_mapping_file", type=str, default=None, help="Path to JSON/pickle file mapping keys to scores (pickscore, aesthetic, clip_score, hps_score). Scores are loaded on-the-fly during training."
+    )
+    parser.add_argument(
+        "--streaming", action="store_true", help="Use streaming mode to avoid downloading entire dataset (saves disk space)"
     )
     # Conditional training/inference (SD1.5)
     parser.add_argument("--train_method", type=str, default=None, choices=["sft", "dpo", "csft", "cdpo"], help="Training method: sft/dpo/csft/cdpo")
@@ -858,15 +882,33 @@ def main():
         
         
         
+    # Load scores mapping if provided
+    scores_mapping = None
+    if args.scores_mapping_file is not None:
+        logger.info(f"Loading scores mapping from {args.scores_mapping_file}")
+        import json
+        import pickle
+        import hashlib
+        if args.scores_mapping_file.endswith(('.pkl', '.pickle')):
+            with open(args.scores_mapping_file, 'rb') as f:
+                scores_mapping = pickle.load(f)
+        else:
+            with open(args.scores_mapping_file, 'r') as f:
+                scores_mapping = json.load(f)
+        logger.info(f"Loaded scores mapping with {len(scores_mapping)} entries")
+    
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
+        if args.streaming:
+            logger.info("Loading dataset in streaming mode (no disk download)")
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
             cache_dir=args.cache_dir,
             data_dir=args.train_data_dir,
+            streaming=args.streaming,
         )
     else:
         data_files = {}
@@ -880,9 +922,76 @@ def main():
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
+    # Helper function to get scores from mapping (used in collate_fn)
+    def get_scores_from_mapping(example, idx=None):
+        """Get scores for an example from the scores mapping."""
+        if scores_mapping is None:
+            return None
+        
+        # Try to get scores by key if it exists in the example
+        if 'key' in example and example['key'] in scores_mapping:
+            return scores_mapping[example['key']]
+        # Try using __key__ (WebDataset format)
+        elif '__key__' in example and example['__key__'] in scores_mapping:
+            return scores_mapping[example['__key__']]
+        # Otherwise try using index as key (for datasets where samples are in order)
+        elif idx is not None and str(idx) in scores_mapping:
+            return scores_mapping[str(idx)]
+        else:
+            # Debug: Print first few misses to diagnose key mismatch
+            if idx is not None and idx < 3:
+                key_tried = example.get('key', 'N/A')
+                # Show a few example keys from the mapping for comparison
+                sample_keys = list(scores_mapping.keys())[:5] if scores_mapping else []
+                logger.warning(f"Score lookup FAILED for idx={idx}, key='{key_tried}'. Example mapping keys: {sample_keys}")
+            # Default to NaN if not found
+            return {
+                "pickscore": [float('nan'), float('nan')],
+                "aesthetic": [float('nan'), float('nan')],
+                "clip_score": [float('nan'), float('nan')],
+                "hps_score": [float('nan'), float('nan')],
+            }
+    
+    # Note: Scores will be added on-the-fly in collate_fn (no preprocessing needed)
+    if scores_mapping is not None:
+        logger.info(f"Scores mapping loaded with {len(scores_mapping)} entries")
+        logger.info("Scores will be added on-the-fly during training (no preprocessing step)")
+
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset[args.split].column_names
+    if args.streaming:
+        # For streaming datasets, peek at first example to get column names
+        first_example = next(iter(dataset[args.split]))
+        column_names = list(first_example.keys())
+        logger.info(f"Streaming dataset columns: {column_names}")
+        
+        # For WebDataset format, map raw column names to expected names
+        if 'jpg_0.jpg' in column_names or '__key__' in column_names:
+            logger.info("Detected WebDataset format in streaming mode - mapping column names")
+            # Map WebDataset column names to standard names
+            column_name_mapping = {}
+            for col in column_names:
+                if col == 'jpg_0.jpg':
+                    column_name_mapping['jpg_0'] = 'jpg_0.jpg'
+                elif col == 'jpg_1.jpg':
+                    column_name_mapping['jpg_1'] = 'jpg_1.jpg'
+                elif col == 'label_0.txt':
+                    column_name_mapping['label_0'] = 'label_0.txt'
+                elif col == 'label_1.txt':
+                    column_name_mapping['label_1'] = 'label_1.txt'
+                elif col == 'original_prompt.txt':
+                    column_name_mapping['caption'] = 'original_prompt.txt'
+                elif col == '__key__':
+                    column_name_mapping['key'] = '__key__'
+            
+            logger.info(f"Column mapping: {column_name_mapping}")
+            # For WebDataset, we'll use the mapped names
+            caption_column = 'original_prompt.txt'
+        else:
+            caption_column = None
+    else:
+        column_names = dataset[args.split].column_names
+        caption_column = None
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
@@ -898,20 +1007,25 @@ def main():
             raise ValueError(
                 f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
             )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    
+    # Handle caption column for both streaming and non-streaming
+    if caption_column is None:
+        if args.caption_column is None:
+            caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+        else:
+            caption_column = args.caption_column
+            if caption_column not in column_names:
+                raise ValueError(
+                    f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+                )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
         captions = []
-        for caption in examples[caption_column]:
+        # For WebDataset streaming, use 'caption' after mapping, otherwise use caption_column
+        cap_col = 'caption' if (args.streaming and 'caption' in examples) else caption_column
+        for caption in examples[cap_col]:
             if random.random() < args.proportion_empty_prompts:
                 captions.append("")
             elif isinstance(caption, str):
@@ -942,44 +1056,219 @@ def main():
     
     ##### START BIG OLD DATASET BLOCK #####
     
+    # Check if dataset has all_scores fields (either from dataset name or from scores_mapping_file)
+    has_all_scores = ("all_scores" in args.dataset_name or 
+                      (scores_mapping is not None) or
+                      ('pickscore' in column_names and 'aesthetic' in column_names and 
+                       'clip_score' in column_names and 'hps_score' in column_names))
+    
+    if has_all_scores:
+        logger.info("Using all_scores mode: pickscore, aesthetic, clip_score, hps_score")
+    else:
+        logger.info("Using mvv_full mode: mps_probs, vqa_scores, vila_scores")
+    
     #### START PREPROCESSING/COLLATION ####
     if args.train_method in ['dpo', 'cdpo']:
         print("Ignoring image_column variable, reading from jpg_0 and jpg_1")
         def preprocess_train(examples):
+            # Handle WebDataset format column names in streaming mode
+            if args.streaming and 'jpg_0.jpg' in examples:
+                # Map WebDataset columns to expected names
+                # Use 'caption' as the target key regardless of source
+                
+                # Robustly derive label from multiple possible encodings (reversed from build_all_scores_hf_dataset.py)
+                # When jpg_0 wins (l0 > l1), label_0 = 1
+                def decode_label(sample_idx):
+                    l0_raw = examples.get('label_0.txt', examples.get('label_0', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                    l1_raw = examples.get('label_1.txt', examples.get('label_1', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                    
+                    def decode_numeric(value):
+                        if isinstance(value, (bytes, bytearray)):
+                            try:
+                                s = value.decode('utf-8', errors='ignore').strip().strip('"')
+                            except Exception:
+                                return None
+                        elif isinstance(value, str):
+                            s = value.strip().strip('"')
+                        elif isinstance(value, (int, float, np.floating, np.integer)):
+                            return float(value)
+                        else:
+                            return None
+                        try:
+                            return float(s)
+                        except Exception:
+                            return None
+                    
+                    l0 = decode_numeric(l0_raw)
+                    l1 = decode_numeric(l1_raw)
+                    
+                    label_value = None
+                    if l0 is not None and l1 is not None:
+                        # REVERSED: if l0 > l1, jpg_0 wins, so label_0 = 1
+                        if l0 > l1:
+                            label_value = 1
+                        elif l1 > l0:
+                            label_value = 0
+                    elif l0 is not None:
+                        # REVERSED: if l0 >= 0.5, jpg_0 wins, so label_0 = 1
+                        if l0 >= 0.5:
+                            label_value = 1
+                        else:
+                            label_value = 0
+                    elif l1 is not None:
+                        # REVERSED: if l1 >= 0.5, jpg_1 wins, so label_0 = 0
+                        if l1 >= 0.5:
+                            label_value = 0
+                        else:
+                            label_value = 1
+                    
+                    if label_value is None:
+                        label_value = -1  # Invalid/tie
+                    
+                    return label_value
+                
+                num_samples = len(examples.get('jpg_0.jpg', examples.get('jpg_0', [])))
+                labels = [decode_label(i) for i in range(num_samples)]
+                
+                # Debug: check what fields are available for unique identification
+                # print(f"DEBUG: Available fields: {list(examples.keys())}")
+                # print(f"DEBUG: Has __url__: {'__url__' in examples}, Has __key__: {'__key__' in examples}")
+                # if '__url__' in examples:
+                #     print(f"DEBUG: __url__ sample: {examples['__url__'][:2] if len(examples.get('__url__', [])) >= 2 else examples.get('__url__')}")
+                # if '__key__' in examples:
+                #     print(f"DEBUG: __key__ sample: {examples['__key__'][:2] if len(examples.get('__key__', [])) >= 2 else examples.get('__key__')}")
+                
+                examples_mapped = {
+                    'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
+                    'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
+                    'label_0': labels,
+                    'caption': [x.decode('utf-8') if isinstance(x, bytes) else x for x in examples.get('original_prompt.txt', examples.get('caption', []))],
+                }
+                
+                # __key__ alone is not unique (resets per shard), need to construct unique ID
+                # Combine shard ID (from __url__) with __key__ to create globally unique keys
+                if '__key__' in examples and '__url__' in examples:
+                    # Extract shard ID from URL (e.g., "000001" from "path/to/000001.tar")
+                    urls = examples['__url__']
+                    keys = examples['__key__']
+                    
+                    unique_keys = []
+                    for url, key in zip(urls, keys):
+                        # Extract filename from URL and get shard ID
+                        filename = os.path.basename(url) if isinstance(url, str) else url
+                        shard_id = os.path.splitext(filename)[0] if isinstance(filename, str) else str(filename)
+                        # Create unique key: shard_id + "_" + local_key
+                        unique_key = f"{shard_id}_{key}"
+                        unique_keys.append(unique_key)
+                    
+                    # print(f"DEBUG: Constructed unique_keys sample: {unique_keys[:3]}")
+                    examples_mapped['key'] = unique_keys
+                    examples_mapped['url'] = urls
+                elif '__key__' in examples:
+                    # Fallback: use __key__ alone (will have collisions but better than nothing)
+                    logger.warning("__url__ not found in streaming data, using non-unique __key__ (may cause score lookup issues)")
+                    raise ValueError("__url__ not found in streaming data")
+                    
+                examples = examples_mapped
+                # For tokenization, always use 'caption' after mapping
+                examples['caption'] = examples.get('caption', [])
+                
+                # Print sample to diagnose key uniqueness issue
+                # if len(examples['label_0']) > 0:
+                #     print(f"  Sample 0: key={examples.get('key', ['N/A'])[0]}, url={examples.get('url', ['N/A'])[0]}, caption={examples['caption'][0][:60]}...")
             all_pixel_values = []
             for col_name in ['jpg_0', 'jpg_1']:
-                images = [Image.open(io.BytesIO(im_bytes)).convert("RGB")
-                            for im_bytes in examples[col_name]]
+                # Handle both bytes (non-streaming) and PIL Images (streaming)
+                images = []
+                for im_data in examples[col_name]:
+                    if isinstance(im_data, bytes):
+                        # Non-streaming: decode from bytes
+                        images.append(Image.open(io.BytesIO(im_data)).convert("RGB"))
+                    else:
+                        # Streaming: already a PIL Image
+                        images.append(im_data.convert("RGB") if hasattr(im_data, 'convert') else im_data)
                 pixel_values = [train_transforms(image) for image in images]
                 all_pixel_values.append(pixel_values)
             # Double on channel dim, jpg_y then jpg_w
             im_tup_iterator = zip(*all_pixel_values)
             combined_pixel_values = []
-            win_mps = []
-            lose_mps = []
-            win_vqa = []
-            lose_vqa = []
-            win_vila = []
-            lose_vila = []
-            for im_tup, label_0, mps_probs, vqa_scores, vila_scores in zip(im_tup_iterator, examples['label_0'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
-                if label_0==0 and (not args.choice_model): # don't want to flip things if using choice_model for AI feedback
-                    im_tup = im_tup[::-1]
-                combined_im = torch.cat(im_tup, dim=0) # no batch dim
-                combined_pixel_values.append(combined_im)
-                win_idx = 0 if label_0==1 else 1
-                win_mps.append(normalize_mps(mps_probs[win_idx]))
-                lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
-                win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
-                lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
-                win_vila.append(normalize_vila(vila_scores[win_idx]))
-                lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
-            examples["win_mps_probs"] = win_mps
-            examples["lose_mps_probs"] = lose_mps
-            examples["win_vqa_scores"] = win_vqa
-            examples["lose_vqa_scores"] = lose_vqa
-            examples["win_vila_scores"] = win_vila
-            examples["lose_vila_scores"] = lose_vila
-            examples["pixel_values"] = combined_pixel_values
+            if has_all_scores:
+                win_pickscore = []
+                lose_pickscore = []
+                win_aesthetic = []
+                lose_aesthetic = []
+                win_clip_score = []
+                lose_clip_score = []
+                win_hps_score = []
+                lose_hps_score = []
+                
+                # Get scores from mapping if not in examples
+                if 'pickscore' not in examples and scores_mapping is not None:
+                    pickscores_list = []
+                    aesthetics_list = []
+                    clip_scores_list = []
+                    hps_scores_list = []
+                    for i in range(len(examples['label_0'])):
+                        example_dict = {k: v[i] if isinstance(v, list) else v for k, v in examples.items()}
+                        scores = get_scores_from_mapping(example_dict, idx=i)
+                        pickscores_list.append(scores['pickscore'])
+                        aesthetics_list.append(scores['aesthetic'])
+                        clip_scores_list.append(scores['clip_score'])
+                        hps_scores_list.append(scores['hps_score'])
+                    examples['pickscore'] = pickscores_list
+                    examples['aesthetic'] = aesthetics_list
+                    examples['clip_score'] = clip_scores_list
+                    examples['hps_score'] = hps_scores_list
+                
+                for im_tup, label_0, pickscore, aesthetic, clip_score, hps_score in zip(im_tup_iterator, examples['label_0'], examples['pickscore'], examples['aesthetic'], examples['clip_score'], examples['hps_score']):
+                    if label_0==0 and (not args.choice_model): # don't want to flip things if using choice_model for AI feedback
+                        im_tup = im_tup[::-1]
+                    combined_im = torch.cat(im_tup, dim=0) # no batch dim
+                    combined_pixel_values.append(combined_im)
+                    win_idx = 0 if label_0==1 else 1
+                    win_pickscore.append(normalize_pick(pickscore[win_idx]))
+                    lose_pickscore.append(normalize_pick(pickscore[1-win_idx]))
+                    win_aesthetic.append(normalize_aes(aesthetic[win_idx]))
+                    lose_aesthetic.append(normalize_aes(aesthetic[1-win_idx]))
+                    win_clip_score.append(normalize_clip(clip_score[win_idx]))
+                    lose_clip_score.append(normalize_clip(clip_score[1-win_idx]))
+                    win_hps_score.append(normalize_hps(hps_score[win_idx]))
+                    lose_hps_score.append(normalize_hps(hps_score[1-win_idx]))
+                examples["win_pickscore"] = win_pickscore
+                examples["lose_pickscore"] = lose_pickscore
+                examples["win_aesthetic"] = win_aesthetic
+                examples["lose_aesthetic"] = lose_aesthetic
+                examples["win_clip_score"] = win_clip_score
+                examples["lose_clip_score"] = lose_clip_score
+                examples["win_hps_score"] = win_hps_score
+                examples["lose_hps_score"] = lose_hps_score
+                examples["pixel_values"] = combined_pixel_values
+            else:
+                win_mps = []
+                lose_mps = []
+                win_vqa = []
+                lose_vqa = []
+                win_vila = []
+                lose_vila = []
+                for im_tup, label_0, mps_probs, vqa_scores, vila_scores in zip(im_tup_iterator, examples['label_0'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
+                    if label_0==0 and (not args.choice_model): # don't want to flip things if using choice_model for AI feedback
+                        im_tup = im_tup[::-1]
+                    combined_im = torch.cat(im_tup, dim=0) # no batch dim
+                    combined_pixel_values.append(combined_im)
+                    win_idx = 0 if label_0==1 else 1
+                    win_mps.append(normalize_mps(mps_probs[win_idx]))
+                    lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
+                    win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
+                    lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
+                    win_vila.append(normalize_vila(vila_scores[win_idx]))
+                    lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
+                examples["win_mps_probs"] = win_mps
+                examples["lose_mps_probs"] = lose_mps
+                examples["win_vqa_scores"] = win_vqa
+                examples["lose_vqa_scores"] = lose_vqa
+                examples["win_vila_scores"] = win_vila
+                examples["lose_vila_scores"] = lose_vila
+                examples["pixel_values"] = combined_pixel_values
             # SDXL takes raw prompts
             if not args.sdxl: examples["input_ids"] = tokenize_captions(examples)
             return examples
@@ -1002,14 +1291,33 @@ def main():
                             return 'lose'
                         else:
                             return 'tie'
-                    conds = [f'win {cond_text(example["win_mps_probs"], example["lose_mps_probs"])} {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples] + [f'lose {cond_text(example["lose_mps_probs"], example["win_mps_probs"])} {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
+                    if has_all_scores:
+                        win_conds = [f'win {cond_text(example["win_pickscore"], example["lose_pickscore"])} {cond_text(example["win_aesthetic"], example["lose_aesthetic"])} {cond_text(example["win_clip_score"], example["lose_clip_score"])} {cond_text(example["win_hps_score"], example["lose_hps_score"])}' for example in examples]
+                        lose_conds = [f'lose {cond_text(example["lose_pickscore"], example["win_pickscore"])} {cond_text(example["lose_aesthetic"], example["win_aesthetic"])} {cond_text(example["lose_clip_score"], example["win_clip_score"])} {cond_text(example["lose_hps_score"], example["win_hps_score"])}' for example in examples]
+                    else:
+                        win_conds = [f'win {cond_text(example["win_mps_probs"], example["lose_mps_probs"])} {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples]
+                        lose_conds = [f'lose {cond_text(example["lose_mps_probs"], example["win_mps_probs"])} {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
                     # conds = [f'win {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples] + [f'lose {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
-                    # print(conds[0], conds[-1])
+                    # print(win_conds[0], lose_conds[0])
+                    # Tokenize win and lose conditions separately, then stack along dimension 1
+                    win_cond_input_ids = tokenizer(win_conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+                    lose_cond_input_ids = tokenizer(lose_conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+                    # Stack to shape [batch_size, 2, seq_len] where dim 1 is [win, lose]
+                    cond_input_ids = torch.stack([win_cond_input_ids, lose_cond_input_ids], dim=1)
+                    # For multi_dim, store which condition was used (always 0 for win in this case since we store both)
+                    # This is used for non-simultaneous conditioning to select which condition to use
+                    cond_is_positive = torch.ones(len(examples), dtype=torch.long)  # Placeholder, actual selection happens in training loop
+                    # print(f"DEBUG: key: {examples[0]['key']}, win_conds: {win_conds[0]}, lose_conds: {lose_conds[0]}")
                 else:
                     conds = []
                     for _ in examples:
                         conds.append(args.cond_positive_text if random.random() < 0.5 else args.cond_negative_text)
-                return_d["cond_texts"] = conds
+                    # For non-multi_dim, just tokenize - no extra dimension needed
+                    cond_input_ids = tokenizer(conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+                    # Store condition flags as tensor: 1 for positive/win text, 0 for negative/lose text
+                    cond_is_positive = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], dtype=torch.long)
+                return_d["cond_input_ids"] = cond_input_ids
+                return_d["cond_is_positive"] = cond_is_positive
                 
             if args.choice_model:
                 # If using AIF then deliver image data for choice model to determine if should flip pixel values
@@ -1063,22 +1371,112 @@ def main():
             return return_d
     elif args.train_method == 'csft':
         def preprocess_train(examples):
-            win_images = []
-            lose_images = []
-            captions = []
-            win_mps = []
-            lose_mps = []
-            win_vqa = []
-            lose_vqa = []
-            win_vila = []
-            lose_vila = []
-            if 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
-                for im_0_bytes, im_1_bytes, label_0, cap, mps_probs, vqa_scores, vila_scores in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
+            # Handle WebDataset format column names in streaming mode
+            if args.streaming and 'jpg_0.jpg' in examples:
+                # Map WebDataset columns to expected names
+                examples_mapped = {
+                    'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
+                    'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
+                    'label_0': [int(float(x.decode('utf-8') if isinstance(x, bytes) else x)) for x in examples.get('label_0.txt', examples.get('label_0', []))],
+                    'caption': [x.decode('utf-8') if isinstance(x, bytes) else x for x in examples.get('original_prompt.txt', examples.get('caption', []))],
+                }
+                
+                # Construct unique keys (same as dpo branch)
+                if '__key__' in examples and '__url__' in examples:
+                    # Extract shard ID from URL and combine with local key
+                    urls = examples['__url__']
+                    keys = examples['__key__']
+                    
+                    unique_keys = []
+                    for url, key in zip(urls, keys):
+                        filename = os.path.basename(url) if isinstance(url, str) else url
+                        shard_id = os.path.splitext(filename)[0] if isinstance(filename, str) else str(filename)
+                        unique_key = f"{shard_id}_{key}"
+                        unique_keys.append(unique_key)
+                    
+                    examples_mapped['key'] = unique_keys
+                    examples_mapped['url'] = urls
+                elif '__key__' in examples:
+                    logger.warning("__url__ not found in streaming data for csft, using non-unique __key__")
+                    raise ValueError("__url__ not found in streaming data")
+                
+                examples = examples_mapped
+            
+            if has_all_scores:
+                win_images = []
+                lose_images = []
+                captions = []
+                win_pickscore = []
+                lose_pickscore = []
+                win_aesthetic = []
+                lose_aesthetic = []
+                win_clip_score = []
+                lose_clip_score = []
+                win_hps_score = []
+                lose_hps_score = []
+                
+                # Get scores from mapping if not in examples
+                if 'pickscore' not in examples and scores_mapping is not None:
+                    pickscores_list = []
+                    aesthetics_list = []
+                    clip_scores_list = []
+                    hps_scores_list = []
+                    for i in range(len(examples['label_0'])):
+                        example_dict = {k: v[i] if isinstance(v, list) else v for k, v in examples.items()}
+                        scores = get_scores_from_mapping(example_dict, idx=i)
+                        pickscores_list.append(scores['pickscore'])
+                        aesthetics_list.append(scores['aesthetic'])
+                        clip_scores_list.append(scores['clip_score'])
+                        hps_scores_list.append(scores['hps_score'])
+                    examples['pickscore'] = pickscores_list
+                    examples['aesthetic'] = aesthetics_list
+                    examples['clip_score'] = clip_scores_list
+                    examples['hps_score'] = hps_scores_list
+                
+                for im_0_data, im_1_data, label_0, cap, pickscore, aesthetic, clip_score, hps_score in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['pickscore'], examples['aesthetic'], examples['clip_score'], examples['hps_score']):
                     assert label_0 in (0, 1)
-                    im_win_bytes = im_0_bytes if label_0==1 else im_1_bytes
-                    im_lose_bytes = im_1_bytes if label_0==1 else im_0_bytes
-                    win_images.append(Image.open(io.BytesIO(im_win_bytes)).convert("RGB"))
-                    lose_images.append(Image.open(io.BytesIO(im_lose_bytes)).convert("RGB"))
+                    im_win_data = im_0_data if label_0==1 else im_1_data
+                    im_lose_data = im_1_data if label_0==1 else im_0_data
+                    
+                    # Handle both bytes (non-streaming) and PIL Images (streaming)
+                    if isinstance(im_win_data, bytes):
+                        win_images.append(Image.open(io.BytesIO(im_win_data)).convert("RGB"))
+                        lose_images.append(Image.open(io.BytesIO(im_lose_data)).convert("RGB"))
+                    else:
+                        win_images.append(im_win_data.convert("RGB") if hasattr(im_win_data, 'convert') else im_win_data)
+                        lose_images.append(im_lose_data.convert("RGB") if hasattr(im_lose_data, 'convert') else im_lose_data)
+                    captions.append(cap)
+                    win_idx = 0 if label_0==1 else 1
+                    win_pickscore.append(normalize_pick(pickscore[win_idx]))
+                    lose_pickscore.append(normalize_pick(pickscore[1-win_idx]))
+                    win_aesthetic.append(normalize_aes(aesthetic[win_idx]))
+                    lose_aesthetic.append(normalize_aes(aesthetic[1-win_idx]))
+                    win_clip_score.append(normalize_clip(clip_score[win_idx]))
+                    lose_clip_score.append(normalize_clip(clip_score[1-win_idx]))
+                    win_hps_score.append(normalize_hps(hps_score[win_idx]))
+                    lose_hps_score.append(normalize_hps(hps_score[1-win_idx]))
+            elif 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
+                win_images = []
+                lose_images = []
+                captions = []
+                win_mps = []
+                lose_mps = []
+                win_vqa = []
+                lose_vqa = []
+                win_vila = []
+                lose_vila = []
+                for im_0_data, im_1_data, label_0, cap, mps_probs, vqa_scores, vila_scores in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
+                    assert label_0 in (0, 1)
+                    im_win_data = im_0_data if label_0==1 else im_1_data
+                    im_lose_data = im_1_data if label_0==1 else im_0_data
+                    
+                    # Handle both bytes (non-streaming) and PIL Images (streaming)
+                    if isinstance(im_win_data, bytes):
+                        win_images.append(Image.open(io.BytesIO(im_win_data)).convert("RGB"))
+                        lose_images.append(Image.open(io.BytesIO(im_lose_data)).convert("RGB"))
+                    else:
+                        win_images.append(im_win_data.convert("RGB") if hasattr(im_win_data, 'convert') else im_win_data)
+                        lose_images.append(im_lose_data.convert("RGB") if hasattr(im_lose_data, 'convert') else im_lose_data)
                     captions.append(cap)
                     win_idx = 0 if label_0==1 else 1
                     win_mps.append(normalize_mps(mps_probs[win_idx]))
@@ -1099,12 +1497,22 @@ def main():
             if not args.sdxl: examples["input_ids"] = tokenize_captions({caption_column: captions})
             else: examples["caption"] = captions
             if args.multi_dim:
-                examples["win_mps_probs"] = win_mps
-                examples["lose_mps_probs"] = lose_mps
-                examples["win_vqa_scores"] = win_vqa
-                examples["lose_vqa_scores"] = lose_vqa
-                examples["win_vila_scores"] = win_vila
-                examples["lose_vila_scores"] = lose_vila
+                if has_all_scores:
+                    examples["win_pickscore"] = win_pickscore
+                    examples["lose_pickscore"] = lose_pickscore
+                    examples["win_aesthetic"] = win_aesthetic
+                    examples["lose_aesthetic"] = lose_aesthetic
+                    examples["win_clip_score"] = win_clip_score
+                    examples["lose_clip_score"] = lose_clip_score
+                    examples["win_hps_score"] = win_hps_score
+                    examples["lose_hps_score"] = lose_hps_score
+                else:
+                    examples["win_mps_probs"] = win_mps
+                    examples["lose_mps_probs"] = lose_mps
+                    examples["win_vqa_scores"] = win_vqa
+                    examples["lose_vqa_scores"] = lose_vqa
+                    examples["win_vila_scores"] = win_vila
+                    examples["lose_vila_scores"] = lose_vila
             return examples
 
         def collate_fn(examples):
@@ -1128,25 +1536,31 @@ def main():
                         return 'lose'
                     else:
                         return 'tie'
-                conds = [f'win {cond_text(ex["win_mps_probs"], ex["lose_mps_probs"])} {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_mps_probs"], ex["win_mps_probs"])} {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
+                if has_all_scores:
+                    conds = [f'win {cond_text(ex["win_pickscore"], ex["lose_pickscore"])} {cond_text(ex["win_aesthetic"], ex["lose_aesthetic"])} {cond_text(ex["win_clip_score"], ex["lose_clip_score"])} {cond_text(ex["win_hps_score"], ex["lose_hps_score"])}' for ex in examples] + [f'lose {cond_text(ex["lose_pickscore"], ex["win_pickscore"])} {cond_text(ex["lose_aesthetic"], ex["win_aesthetic"])} {cond_text(ex["lose_clip_score"], ex["win_clip_score"])} {cond_text(ex["lose_hps_score"], ex["win_hps_score"])}' for ex in examples]
+                else:
+                    conds = [f'win {cond_text(ex["win_mps_probs"], ex["lose_mps_probs"])} {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_mps_probs"], ex["win_mps_probs"])} {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
                 # conds = [f'win {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
                 # print(conds[0], conds[-1])
             else:
                 conds = [args.cond_positive_text for _ in examples] + [args.cond_negative_text for _ in examples]
-            return_d["cond_texts"] = conds
+            # Tokenize condition texts to avoid string concatenation issues with Accelerate
+            cond_input_ids = tokenizer(conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
+            return_d["cond_input_ids"] = cond_input_ids
             return return_d
     #### END PREPROCESSING/COLLATION ####
     
     ### DATASET #####
     with accelerator.main_process_first():
-        # Drop tie/invalid labels for any dataset (e.g., -1 ties)
-        if 'label_0' in dataset[args.split].column_names:
-            orig_len = dataset[args.split].num_rows
-            keep_idx = [i for i, l in enumerate(dataset[args.split]['label_0']) if l in (0, 1)]
-            if len(keep_idx) != orig_len:
-                dataset[args.split] = dataset[args.split].select(keep_idx)
-                new_len = dataset[args.split].num_rows
-                print(f"Dropped {orig_len - new_len}/{orig_len} tie/invalid label examples")
+        # Drop tie/invalid labels for non-streaming datasets (before preprocessing)
+        if not args.streaming:
+            if 'label_0' in dataset[args.split].column_names:
+                orig_len = dataset[args.split].num_rows
+                keep_idx = [i for i, l in enumerate(dataset[args.split]['label_0']) if l in (0, 1)]
+                if len(keep_idx) != orig_len:
+                    dataset[args.split] = dataset[args.split].select(keep_idx)
+                    new_len = dataset[args.split].num_rows
+                    print(f"Dropped {orig_len - new_len}/{orig_len} tie/invalid label examples")
 
         # Normalize semantics for hagiss/mvv_full: label_0==0 means jpg_0 wins
         if 'hagiss/mvv_full' in args.dataset_name and 'label_0' in dataset[args.split].column_names:
@@ -1164,14 +1578,27 @@ def main():
                 print(f"Eliminated {orig_len - new_len}/{orig_len} non-dreamlike gens for Pick-a-pic")
                 
         if args.max_train_samples is not None:
-            dataset[args.split] = dataset[args.split].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            if args.streaming:
+                # For streaming datasets, use take() instead of select()
+                dataset[args.split] = dataset[args.split].shuffle(seed=args.seed, buffer_size=10000).take(args.max_train_samples)
+            else:
+                dataset[args.split] = dataset[args.split].shuffle(seed=args.seed).select(range(args.max_train_samples))
+        
         # Set the training transforms
-        train_dataset = dataset[args.split].with_transform(preprocess_train)
+        if args.streaming:
+            # For streaming datasets, use map() instead of with_transform()
+            # First apply preprocessing to generate label_0
+            train_dataset = dataset[args.split].map(preprocess_train, batched=True, batch_size=args.train_batch_size)
+            # Then filter out tie/invalid labels (must happen after preprocessing for WebDataset format)
+            logger.info("Filtering out tie/invalid labels (label_0 not in {0, 1}) for streaming dataset")
+            train_dataset = train_dataset.filter(lambda example: example.get('label_0', -1) in (0, 1))
+        else:
+            train_dataset = dataset[args.split].with_transform(preprocess_train)
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle=(args.split=='train'),
+        shuffle=(args.split=='train' and not args.streaming),  # Don't shuffle streaming datasets
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
@@ -1181,10 +1608,22 @@ def main():
     
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+    
+    if args.streaming:
+        # For streaming datasets, we can't get the length
+        # User must specify max_train_steps
+        if args.max_train_steps is None:
+            raise ValueError(
+                "When using --streaming, you must specify --max_train_steps "
+                "since streaming datasets don't have a known length."
+            )
+        num_update_steps_per_epoch = args.max_train_steps  # Dummy value for streaming
+        logger.info(f"Streaming mode: using max_train_steps={args.max_train_steps}")
+    else:
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        if args.max_train_steps is None:
+            args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+            overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -1239,11 +1678,16 @@ def main():
     
     
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    if not args.streaming:
+        # Only recalculate for non-streaming datasets
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        if overrode_max_train_steps:
+            args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        # Afterwards we recalculate our number of training epochs
+        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    else:
+        # For streaming, we already set max_train_steps and can't calculate epochs
+        logger.info(f"Streaming mode: training for {args.max_train_steps} steps")
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -1397,7 +1841,7 @@ def main():
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    # logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -1464,25 +1908,44 @@ def main():
                         if args.simultaneous_conditioning:
                             feed_pixel_values = torch.cat([winners, losers, losers, winners], dim=0)
                             if args.multi_dim:
-                                batch["cond_texts"] = batch["cond_texts"] + batch["cond_texts"]
+                                # cond_input_ids has shape [batch_size, 2, seq_len] where dim 1 is [win, lose]
+                                win_cond_input_ids = batch["cond_input_ids"][:, 0, :]  # [batch_size, seq_len]
+                                lose_cond_input_ids = batch["cond_input_ids"][:, 1, :]  # [batch_size, seq_len]
+                                # Concatenate: [win, lose, win, lose] to align with [winners, losers, losers, winners]
+                                batch["cond_input_ids"] = torch.cat([win_cond_input_ids, lose_cond_input_ids, win_cond_input_ids, lose_cond_input_ids], dim=0)
                             else:
-                                batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])] + [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                                cond_texts_updated = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])] + [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                                # Re-tokenize for updated conditions
+                                batch["cond_input_ids"] = tokenizer(cond_texts_updated, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device)
                         elif args.jeremy_conditioning:
                             feed_pixel_values = torch.cat([winners, losers], dim=0)
-                            batch["cond_texts"] = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
+                            cond_texts_updated = [args.cond_positive_text for _ in range(winners.shape[0])] + [args.cond_negative_text for _ in range(losers.shape[0])]
                             null_cond_texts = ["" for _ in range(winners.shape[0])]
+                            # Re-tokenize for updated conditions
+                            batch["cond_input_ids"] = tokenizer(cond_texts_updated, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device)
                         else:
                             # Conditional DPO: condition selects preferred side
-                            conds = batch["cond_texts"]
-                            cond_is_win = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], device=winners.device).view(-1, 1, 1, 1)
-                            first = torch.where(cond_is_win == 1, winners, losers)
-                            second = torch.where(cond_is_win == 1, losers, winners)
+                            if args.multi_dim:
+                                # Randomly select win or lose conditions for each example
+                                # cond_input_ids has shape [batch_size, 2, seq_len]
+                                cond_is_win = torch.randint(0, 2, (winners.shape[0],), device=winners.device)
+                                # Select appropriate condition for each example: 0 for win, 1 for lose
+                                selected_conds = []
+                                for i in range(winners.shape[0]):
+                                    selected_conds.append(batch["cond_input_ids"][i, cond_is_win[i], :])
+                                batch["cond_input_ids"] = torch.stack(selected_conds)
+                                # Don't concatenate here - let the repeat at line 1946 handle it
+                            else:
+                                cond_is_win = batch["cond_is_positive"]
+                            cond_is_win_expanded = cond_is_win.view(-1, 1, 1, 1).to(winners.device)
+                            first = torch.where(cond_is_win_expanded == 1, winners, losers)
+                            second = torch.where(cond_is_win_expanded == 1, losers, winners)
                             feed_pixel_values = torch.cat([first, second], dim=0)
                             if (step == 0) and (global_step == 0) and accelerator.is_main_process:
                                 debug_entries = []
                                 for idx in range(min(8, winners.shape[0])):
-                                    cond_label = conds[idx] if idx < len(conds) else "<missing>"
                                     cond_flag = int(cond_is_win[idx].item())
+                                    cond_label = args.cond_positive_text if cond_flag == 1 else args.cond_negative_text
                                     first_matches_winner = bool(torch.allclose(first[idx], winners[idx]))
                                     second_matches_loser = bool(torch.allclose(second[idx], losers[idx]))
                                     debug_entries.append({
@@ -1590,19 +2053,19 @@ def main():
                     # Append condition tokens if conditional methods
                     if args.train_method in ['csft', 'cdpo']:
                         if args.train_method == 'cdpo':
-                            cond_texts = batch["cond_texts"]
+                            cond_input_ids = batch["cond_input_ids"]
                             # Build once for B, then repeat to 2B to align with encoder_hidden_states
                             # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
                             # cond_tokens = cond_tokens.repeat(2, 1, 1)
-                            cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
+                            cond_tokens = text_encoder(cond_input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
                             if not args.simultaneous_conditioning and not args.jeremy_conditioning:
                                 cond_tokens = cond_tokens.repeat(2, 1, 1)
                             if args.jeremy_conditioning:
                                 null_cond_tokens = text_encoder(tokenizer(null_cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
                         else:  # csft (already 2*B)
-                            cond_texts = batch["cond_texts"]
+                            cond_input_ids = batch["cond_input_ids"]
                             # cond_tokens = build_condition_tokens(cond_adapter, tokenizer, text_encoder, cond_texts, accelerator.device, encoder_hidden_states.dtype)
-                            cond_tokens = text_encoder(tokenizer(cond_texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
+                            cond_tokens = text_encoder(cond_input_ids.to(accelerator.device))[0].to(encoder_hidden_states.dtype)
                             # cond_tokens = cond_adapter(cond_tokens)
                         # encoder_hidden_states = torch.cat([encoder_hidden_states, cond_tokens], dim=1)
                 #### END PREP BATCH ####

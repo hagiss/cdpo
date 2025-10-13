@@ -6,10 +6,7 @@ This converts WebDataset shards (.tar files) into a HuggingFace Dataset format
 that can be easily loaded with datasets.load_dataset().
 
 Usage:
-    python build_all_scores_hf_dataset.py \
-        --annotations_dir /data3/jiho/pickapic_annotations_all_scores \
-        --repo_id hagiss/mvv_full_all_scores \
-        --tokens 
+    python build_all_scores_hf_dataset.py --annotations_dir /data3/jiho/pickapic_annotations_all_scores --repo_id hagiss/mvv_full_all_scores --token  
 """
 
 import argparse
@@ -50,6 +47,87 @@ def _is_image_key(k: str) -> bool:
     if base.startswith("jpg_") or base.startswith("jpeg_") or base.startswith("png_"):
         return True
     return False
+
+
+
+def _decode_text(value: object):
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _decode_numeric(value: object):
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            s = value.decode("utf-8", errors="ignore").strip().strip('"')
+        except Exception:
+            return None
+    elif isinstance(value, str):
+        s = value.strip().strip('"')
+    elif isinstance(value, (int, float, np.floating, np.integer)):
+        return float(value)
+    else:
+        try:
+            data = json.loads(value) if not isinstance(value, (bytes, bytearray)) else None
+            if isinstance(data, (int, float)):
+                return float(data)
+        except Exception:
+            pass
+        return None
+
+    try:
+        if s.lower() in ("true", "false"):
+            return 1.0 if s.lower() == "true" else 0.0
+        return float(int(s)) if s.isdigit() or (s.startswith("-") and s[1:].isdigit()) else float(s)
+    except Exception:
+        return None
+
+
+def _decode_label_from_value(v: object):
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            s = v.decode("utf-8", errors="ignore").strip().strip('"')
+        except Exception:
+            return None
+    elif isinstance(v, str):
+        s = v.strip().strip('"')
+    else:
+        try:
+            data = json.loads(v) if not isinstance(v, (bytes, bytearray)) else None
+            if isinstance(data, dict):
+                for k in ("winner", "label", "preferred", "choice"):
+                    if k in data:
+                        return _decode_label_from_value(data[k])
+        except Exception:
+            pass
+        return None
+
+    token_map = {
+        "0": 0,
+        "1": 1,
+        "a": 0,
+        "b": 1,
+        "left": 0,
+        "right": 1,
+        "img0": 0,
+        "img1": 1,
+    }
+    key = s.lower()
+    if key in token_map:
+        return token_map[key]
+    try:
+        iv = int(s)
+        if iv in (0, 1):
+            return iv
+    except Exception:
+        pass
+    return None
+
 
 
 def iter_samples_from_local_shards(
@@ -96,11 +174,56 @@ def iter_samples_from_local_shards(
                 if isinstance(sample, dict) and "__key__" in sample:
                     key = sample["__key__"]
                     cand = sorted([k for k in sample.keys() if _is_image_key(k)])
+                    # Robustly derive label from multiple possible encodings
+                    l0 = _decode_numeric(sample.get("label_0.txt"))
+                    l1 = _decode_numeric(sample.get("label_1.txt"))
+                    label_value = None
+                    if l0 is not None and l1 is not None:
+                        if l0 > l1:
+                            label_value = 0
+                        elif l1 > l0:
+                            label_value = 1
+                    elif l0 is not None:
+                        if l0 >= 0.5:
+                            label_value = 0
+                    elif l1 is not None:
+                        if l1 >= 0.5:
+                            label_value = 1
+
+                    if label_value is None:
+                        # Fallbacks: single-field label encodings
+                        for name in (
+                            "winner.txt",
+                            "label.txt",
+                            "preferred.txt",
+                            "choice.txt",
+                            "winner.json",
+                            "label.json",
+                            "label_0",  # sometimes present as int/str
+                        ):
+                            if name in sample:
+                                lbl = _decode_label_from_value(sample.get(name)) if name.endswith((".txt", ".json")) else sample.get(name)
+                                if isinstance(lbl, (int, np.integer)) and int(lbl) in (0, 1):
+                                    label_value = int(lbl)
+                                    break
+                                if lbl is not None and not isinstance(lbl, (int, np.integer)):
+                                    parsed = _decode_label_from_value(lbl)
+                                    if isinstance(parsed, int) and parsed in (0, 1):
+                                        label_value = parsed
+                                        break
+
+                    if label_value is None:
+                        label_value = -1
+                    # Decode text field as a single caption (fallback to prompt)
+                    prompt_val = _decode_text(sample.get("original_prompt.txt")) or _decode_text(sample.get("prompt.txt"))
+                    caption_val = _decode_text(sample.get("caption.txt"))
+                    caption_final = caption_val or (prompt_val or "")
+
                     src_data[key] = {
                         "img0": sample.get(cand[0]) if len(cand) > 0 else None,
                         "img1": sample.get(cand[1]) if len(cand) > 1 else None,
-                        "prompt": sample.get("original_prompt.txt", b"").decode("utf-8") if isinstance(sample.get("original_prompt.txt"), bytes) else "",
-                        "label": sample.get("label_0", -1),
+                        "prompt": caption_final,
+                        "label": label_value
                     }
         except Exception as e:
             print(f"Warning: Could not load source data for {shard_file}: {e}")
