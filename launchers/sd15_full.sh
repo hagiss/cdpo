@@ -15,7 +15,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch train.py \
   --learning_rate=1e-8 --scale_lr \
   --cache_dir="/data4/mvv_full/" \
   --checkpointing_steps 200 \
-  --beta_dpo 5000 \
+  --beta_dpo 10000 \
   --cdpo \
   --multi_dim \
   --streaming \
@@ -28,4 +28,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch train.py \
   --ip_adapter \
   --report_to="wandb" \
   --simultaneous_conditioning \
-  --output_dir="tmp-sd15-all-scores-cdpo-1000steps-5000beta-2048batch-fixlabel-20norm-mlp-ipadapter-sfttrained-simultaneous-simple-multidim"
+  --output_dir="tmp-sd15-all-scores-cdpo-1000steps-10000beta-2048batch-fixlabel-100norm-mlp-ipadapter-sfttrained-simultaneous-simple-multidim"

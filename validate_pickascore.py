@@ -52,6 +52,10 @@ def build_pipelines(
         pipe_base = StableDiffusionPipeline.from_pretrained(
             pretrained_model_name, torch_dtype=torch_dtype
         )
+        unet_id = "models/dpo-sd1.5"
+        unet = UNet2DConditionModel.from_pretrained(unet_id, subfolder="unet", torch_dtype=torch.float16)
+        pipe_base.unet = unet
+
     pipe_base = pipe_base.to(device)
     if disable_safety_checker:
         try:
@@ -324,7 +328,15 @@ def safe_import_selectors(device: str):
     except Exception as e:
         print(f"[WARN] HPS selector unavailable: {e}")
 
-    return ps_selector, aes_selector, hps_selector
+    # CLIP optional
+    clip_selector = None
+    try:
+        from utils.clip_utils import Selector as CLIPSelector
+        clip_selector = CLIPSelector(device)
+    except Exception as e:
+        print(f"[WARN] CLIP selector unavailable: {e}")
+
+    return ps_selector, aes_selector, hps_selector, clip_selector
 
 
 def fmt_mean(sums, counts, idx: int):
@@ -340,7 +352,7 @@ def fmt_winrate(wins: Optional[int], losses: Optional[int]):
 
 def cmd_eval_folders(args: argparse.Namespace) -> None:
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
-    ps_selector, aes_selector, hps_selector = safe_import_selectors(device)
+    ps_selector, aes_selector, hps_selector, clip_selector = safe_import_selectors(device)
 
     prompts = load_prompt_list_for_eval(args.prompts)
     base_paths = get_sorted_image_paths(args.baseline_folder)
@@ -357,6 +369,8 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
     aes_counts = [0, 0] if aes_selector is not None else None
     hps_sums = [0.0, 0.0] if hps_selector is not None else None
     hps_counts = [0, 0] if hps_selector is not None else None
+    clip_sums = [0.0, 0.0] if clip_selector is not None else None
+    clip_counts = [0, 0] if clip_selector is not None else None
 
     ps_wins = 0
     ps_losses = 0
@@ -367,6 +381,9 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
     hps_wins = 0 if hps_selector is not None else None
     hps_losses = 0 if hps_selector is not None else None
     hps_ties = 0 if hps_selector is not None else None
+    clip_wins = 0 if clip_selector is not None else None
+    clip_losses = 0 if clip_selector is not None else None
+    clip_ties = 0 if clip_selector is not None else None
 
     for idx in range(n):
         prompt = prompts[idx]
@@ -428,6 +445,25 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
             except Exception as e:
                 print(f"[WARN] HPS scoring failed at index {idx}: {e}")
 
+        # CLIP
+        if clip_selector is not None:
+            try:
+                clip_scores = clip_selector.score(ims, prompt)
+                for i, s in enumerate(clip_scores[:2]):
+                    clip_sums[i] += float(s)
+                    clip_counts[i] += 1
+                if len(clip_scores) >= 2:
+                    base_clip = float(clip_scores[0])
+                    dpo_clip = float(clip_scores[1])
+                    if dpo_clip > base_clip + 1e-8:
+                        clip_wins += 1
+                    elif base_clip > dpo_clip + 1e-8:
+                        clip_losses += 1
+                    else:
+                        clip_ties += 1
+            except Exception as e:
+                print(f"[WARN] CLIP scoring failed at index {idx}: {e}")
+
         if (idx + 1) % max(1, args.log_every) == 0:
             print(f"Scored {idx + 1}/{n}")
 
@@ -441,6 +477,10 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
         print(f"HPS mean - Baseline: {fmt_mean(hps_sums, hps_counts, 0)}, DPO: {fmt_mean(hps_sums, hps_counts, 1)}")
     else:
         print("HPS mean - skipped (HPS selector unavailable)")
+    if clip_sums is not None:
+        print(f"CLIP mean - Baseline: {fmt_mean(clip_sums, clip_counts, 0)}, DPO: {fmt_mean(clip_sums, clip_counts, 1)}")
+    else:
+        print("CLIP mean - skipped (CLIP selector unavailable)")
 
     print("\n==== Win rates (DPO vs Baseline) ====")
     print(f"PickScore win-rate: {fmt_winrate(ps_wins, ps_losses)} (wins={ps_wins}, losses={ps_losses}, ties={ps_ties})")
@@ -452,6 +492,10 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
         print(f"HPS win-rate: {fmt_winrate(hps_wins, hps_losses)} (wins={hps_wins}, losses={hps_losses}, ties={hps_ties})")
     else:
         print("HPS win-rate - skipped (HPS selector unavailable)")
+    if clip_sums is not None:
+        print(f"CLIP win-rate: {fmt_winrate(clip_wins, clip_losses)} (wins={clip_wins}, losses={clip_losses}, ties={clip_ties})")
+    else:
+        print("CLIP win-rate - skipped (CLIP selector unavailable)")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
