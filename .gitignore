@@ -1,5 +1,7 @@
 __pycache__/
+.vscode
 
 wandb/
 tmp-sd15*
 outputs/
+data/

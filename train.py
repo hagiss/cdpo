@@ -2397,36 +2397,36 @@ def main():
     # Create the pipeline using the trained modules and save it.
     # This will save to top level of output_dir instead of a checkpoint directory
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        if args.sdxl:
-            # Serialize pipeline.
-            vae = AutoencoderKL.from_pretrained(
-                vae_path,
-                subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-                revision=args.revision,
-                torch_dtype=weight_dtype,
-            )
-            pipeline = StableDiffusionXLPipeline.from_pretrained(
-                args.pretrained_model_name_or_path, unet=unet, vae=vae, revision=args.revision, torch_dtype=weight_dtype
-            )
-            pipeline.save_pretrained(args.output_dir)
-        else:
-            pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                text_encoder=text_encoder,
-                vae=vae,
-                unet=unet,
-                revision=args.revision,
-            )
-        pipeline.save_pretrained(args.output_dir)
-        # Save conditional adapter alongside pipeline for SD1.5 conditional methods
-        if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]) and (not args.ip_adapter):
-            try:
-                ca = accelerator.unwrap_model(cond_adapter)
-            except Exception:
-                ca = cond_adapter
-            ca.save_pretrained(os.path.join(args.output_dir, "cond_adapter"))
+    # if accelerator.is_main_process:
+    #     unet = accelerator.unwrap_model(unet)
+    #     if args.sdxl:
+    #         # Serialize pipeline.
+    #         vae = AutoencoderKL.from_pretrained(
+    #             vae_path,
+    #             subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+    #             revision=args.revision,
+    #             torch_dtype=weight_dtype,
+    #         )
+    #         pipeline = StableDiffusionXLPipeline.from_pretrained(
+    #             args.pretrained_model_name_or_path, unet=unet, vae=vae, revision=args.revision, torch_dtype=weight_dtype
+    #         )
+    #         pipeline.save_pretrained(args.output_dir)
+    #     else:
+    #         pipeline = StableDiffusionPipeline.from_pretrained(
+    #             args.pretrained_model_name_or_path,
+    #             text_encoder=text_encoder,
+    #             vae=vae,
+    #             unet=unet,
+    #             revision=args.revision,
+    #         )
+    #     pipeline.save_pretrained(args.output_dir)
+    #     # Save conditional adapter alongside pipeline for SD1.5 conditional methods
+    #     if (not args.sdxl) and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]) and (not args.ip_adapter):
+    #         try:
+    #             ca = accelerator.unwrap_model(cond_adapter)
+    #         except Exception:
+    #             ca = cond_adapter
+    #         ca.save_pretrained(os.path.join(args.output_dir, "cond_adapter"))
 
 
     accelerator.end_training()
