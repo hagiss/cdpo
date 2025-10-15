@@ -119,19 +119,19 @@ def normalize_vila(vila):
 
 def normalize_pick(pick):
     norm = (pick - MIN_PICK) / (MAX_PICK - MIN_PICK)
-    return int(round(norm * 20 + 1))
+    return int(round(norm * 100 + 1))
 
 def normalize_aes(aes):
     norm = (aes - MIN_AES) / (MAX_AES - MIN_AES)
-    return int(round(norm * 20 + 1))
+    return int(round(norm * 100 + 1))
 
 def normalize_clip(clip):
     norm = (clip - MIN_CLIP) / (MAX_CLIP - MIN_CLIP)
-    return int(round(norm * 20 + 1))
+    return int(round(norm * 100 + 1))
 
 def normalize_hps(hps):
     norm = (hps - MIN_HPS) / (MAX_HPS - MIN_HPS)
-    return int(round(norm * 20 + 1))
+    return int(round(norm * 100 + 1))
 
 # def normalize_mps(mps):
 #     return mps
