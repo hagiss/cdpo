@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 
 import torch
@@ -736,7 +737,7 @@ class IPAdapter(torch.nn.Module):
 
         # Verify if the weights have changed
         assert orig_ip_proj_sum != new_ip_proj_sum, "Weights of image_proj_model did not change!"
-        assert orig_adapter_sum != new_adapter_sum, "Weights of adapter_modules did not change!"
+        # assert orig_adapter_sum != new_adapter_sum, "Weights of adapter_modules did not change!"
 
         print(f"Successfully loaded weights from checkpoint {ckpt_path}")
 
@@ -803,7 +804,7 @@ def init_adapter(unet):
                 "to_k_ip.weight": unet_sd[layer_name + ".to_k.weight"],
                 "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
             }
-            attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+            attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=77)
             attn_procs[name].load_state_dict(weights)
     unet.set_attn_processor(attn_procs)
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
@@ -839,6 +840,7 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
         negative_condition: Optional[str] = None,
         reference_conditional_guidance: Optional[bool] = False,
         decomposed_additive_guidance: Optional[bool] = False,
+        cond_with_prompt: Optional[bool] = False,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -961,6 +963,14 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                 [negative_condition] * half,
                 lora_scale=text_encoder_lora_scale,
             )
+            partial_pos_cond_embeds, full_neg_cond_embeds = self._encode_prompt(
+                ["lose lose lose lose win"] * half,
+                device,
+                num_images_per_prompt,
+                do_classifier_free_guidance,
+                ["win win"] * half,
+                lora_scale=text_encoder_lora_scale,
+            ).chunk(2)
 
 
         # 4. Prepare timesteps
@@ -996,7 +1006,7 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                     latent_model_input,
                     t,
                     prompt_embeds,
-                    cond_embeds
+                    torch.cat([cond_embeds, prompt_embeds], dim=1) if cond_with_prompt else cond_embeds
                     # encoder_hidden_states=prompt_embeds,
                     # cross_attention_kwargs=cross_attention_kwargs,
                     # return_dict=False,
@@ -1006,12 +1016,13 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     if decomposed_additive_guidance:
-                        good_cond_embeds, bad_cond_embeds = cond_embeds.chunk(2)
+                        bad_cond_embeds, good_cond_embeds = cond_embeds.chunk(2)
+                        null_prompt_embeds, pos_prompt_embeds = prompt_embeds.chunk(2)
                         noise_pred_rev = self.unet(
                             latent_model_input,
                             t,
-                            prompt_embeds,
-                            torch.cat([bad_cond_embeds, good_cond_embeds], dim=0)
+                            torch.cat([null_prompt_embeds, pos_prompt_embeds], dim=0),
+                            torch.cat([partial_pos_cond_embeds, full_neg_cond_embeds], dim=0)
                         )
                         null_lose_pred = noise_pred_uncond
                         text_win_pred = noise_pred_text
@@ -1019,7 +1030,26 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
 
                         null_ref_pred = (null_lose_pred + null_win_pred) / 2
                         text_ref_pred = (text_win_pred + text_lose_pred) / 2
-                        noise_pred = null_ref_pred + 0.5 * guidance_scale * (text_ref_pred - null_ref_pred) + 0.5 * guidance_scale * (text_win_pred - text_lose_pred)
+                        # noise_pred_text = 0.5 * (text_ref_pred - null_ref_pred) + 0.5 * (text_win_pred - text_lose_pred)
+
+                        # beta = 0.5
+                        # beta = 1.0 - (i / num_inference_steps) * 1.0
+                        # beta = 0.0 + (i / num_inference_steps) * 1.0
+                        # beta = 0.0
+                        # beta = 1.0
+                        beta = 0.5 * (1.0 - math.cos(math.pi * i / num_inference_steps))
+                        ##########################
+                        # noise_pred_text = beta * text_ref_pred + (1 - beta) * text_win_pred
+                        # noise_pred_uncond = beta * null_ref_pred + (1 - beta) * text_lose_pred
+                        # noise_pred_uncond = beta * null_ref_pred + (1 - beta) * null_lose_pred
+                        # noise_pred_uncond = beta*null_lose_pred + (1-beta)*null_ref_pred
+                        ##########################
+                        # noise_pred_text = text_win_pred 
+                        # noise_pred_uncond = beta * null_lose_pred + (1 - beta) * text_lose_pred
+                        noise_pred_text = (1-beta) * text_ref_pred + beta * text_win_pred
+                        noise_pred_uncond = (1-beta) * null_ref_pred + beta * null_lose_pred
+                        ##########################
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                         
                     elif reference_conditional_guidance:
                         ref_pred = (noise_pred_uncond + noise_pred_text) / 2

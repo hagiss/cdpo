@@ -446,7 +446,9 @@ def parse_args():
     parser.add_argument("--cond_num_tokens", type=int, default=1, help="Deprecated")
     parser.add_argument("--cond_positive_text", type=str, default="win", help="Positive condition text")
     parser.add_argument("--cond_negative_text", type=str, default="lose", help="Negative condition text")
+    parser.add_argument("--cond_with_prompt", action='store_true', help="Condition with prompt")
     parser.add_argument("--csft_cond_only", action='store_true', help="In CSFT, freeze UNet and train only conditional adapter")
+    parser.add_argument("--mse_loss_weight", type=float, default=0, help="Weight for model mse loss in DPO")
     parser.add_argument("--ip_adapter", action='store_true', help="Use IP adapter")
     parser.add_argument("--ip_adapter_ckpt", type=str, default=None, help="Path to IP adapter checkpoint")
     parser.add_argument("--simultaneous_conditioning", action='store_true', help="Use simultaneous conditioning")
@@ -749,6 +751,7 @@ def main():
         if args.train_method == "cdpo":
             import copy
             ref_unet = copy.deepcopy(unet)
+            print("!!!!!!!!!!!!!Ref UNet copied!!!!!!!!!!!!!!!")
         ref_unet.requires_grad_(False)    
 
     if args.class_conditioning:
@@ -1040,7 +1043,7 @@ def main():
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
-        return inputs.input_ids
+        return inputs.input_ids, captions
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
@@ -1269,8 +1272,11 @@ def main():
                 examples["win_vila_scores"] = win_vila
                 examples["lose_vila_scores"] = lose_vila
                 examples["pixel_values"] = combined_pixel_values
-            # SDXL takes raw prompts
-            if not args.sdxl: examples["input_ids"] = tokenize_captions(examples)
+            # SDXL takes raw prompts; for SD1.5 also store dropped captions for conditioning logic
+            if not args.sdxl:
+                _input_ids, _captions = tokenize_captions(examples)
+                examples["input_ids"] = _input_ids
+                examples["caption"] = _captions
             return examples
 
         def collate_fn(examples):
@@ -1292,8 +1298,38 @@ def main():
                         else:
                             return 'tie'
                     if has_all_scores:
-                        win_conds = [f'win {cond_text(example["win_pickscore"], example["lose_pickscore"])} {cond_text(example["win_aesthetic"], example["lose_aesthetic"])} {cond_text(example["win_clip_score"], example["lose_clip_score"])} {cond_text(example["win_hps_score"], example["lose_hps_score"])}' for example in examples]
-                        lose_conds = [f'lose {cond_text(example["lose_pickscore"], example["win_pickscore"])} {cond_text(example["lose_aesthetic"], example["win_aesthetic"])} {cond_text(example["lose_clip_score"], example["win_clip_score"])} {cond_text(example["lose_hps_score"], example["win_hps_score"])}' for example in examples]
+                        win_conds = []
+                        lose_conds = []
+                        for example in examples:
+                            caption_val = example.get("caption", "")
+                            if isinstance(caption_val, list):
+                                caption_val = caption_val[0] if caption_val else ""
+
+                            win_parts = [
+                                "win",
+                                cond_text(example["win_aesthetic"], example["lose_aesthetic"]),
+                                # cond_text(example["win_pickscore"], example["lose_pickscore"]),
+                                # cond_text(example["win_hps_score"], example["lose_hps_score"]),
+                            ]
+                            lose_parts = [
+                                "lose",
+                                cond_text(example["lose_aesthetic"], example["win_aesthetic"]),
+                                # cond_text(example["lose_pickscore"], example["win_pickscore"]),
+                                # cond_text(example["lose_hps_score"], example["win_hps_score"]),
+                            ]
+
+                            # Only include clip_score condition if caption isn't dropped
+                            if caption_val:
+                                win_parts.append(cond_text(example["win_pickscore"], example["lose_pickscore"]))
+                                win_parts.append(cond_text(example["win_hps_score"], example["lose_hps_score"]))
+                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"]))
+                                
+                                lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
+                                lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
+                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"]))
+
+                            win_conds.append(" ".join(win_parts))
+                            lose_conds.append(" ".join(lose_parts))
                     else:
                         win_conds = [f'win {cond_text(example["win_mps_probs"], example["lose_mps_probs"])} {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples]
                         lose_conds = [f'lose {cond_text(example["lose_mps_probs"], example["win_mps_probs"])} {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
@@ -1357,7 +1393,9 @@ def main():
             else:
                 images = [image.convert("RGB") for image in examples[image_column]]
             examples["pixel_values"] = [train_transforms(image) for image in images]
-            if not args.sdxl: examples["input_ids"] = tokenize_captions(examples)
+            if not args.sdxl:
+                _input_ids, _ = tokenize_captions(examples)
+                examples["input_ids"] = _input_ids
             return examples
 
         def collate_fn(examples):
@@ -1494,8 +1532,12 @@ def main():
                     captions.append(cap)
             examples["pixel_values_win"] = [train_transforms(img) for img in win_images]
             examples["pixel_values_lose"] = [train_transforms(img) for img in lose_images]
-            if not args.sdxl: examples["input_ids"] = tokenize_captions({caption_column: captions})
-            else: examples["caption"] = captions
+            if not args.sdxl:
+                _input_ids, _captions = tokenize_captions({caption_column: captions})
+                examples["input_ids"] = _input_ids
+                examples["caption"] = _captions
+            else:
+                examples["caption"] = captions
             if args.multi_dim:
                 if has_all_scores:
                     examples["win_pickscore"] = win_pickscore
@@ -1537,7 +1579,39 @@ def main():
                     else:
                         return 'tie'
                 if has_all_scores:
-                    conds = [f'win {cond_text(ex["win_pickscore"], ex["lose_pickscore"])} {cond_text(ex["win_aesthetic"], ex["lose_aesthetic"])} {cond_text(ex["win_clip_score"], ex["lose_clip_score"])} {cond_text(ex["win_hps_score"], ex["lose_hps_score"])}' for ex in examples] + [f'lose {cond_text(ex["lose_pickscore"], ex["win_pickscore"])} {cond_text(ex["lose_aesthetic"], ex["win_aesthetic"])} {cond_text(ex["lose_clip_score"], ex["win_clip_score"])} {cond_text(ex["lose_hps_score"], ex["win_hps_score"])}' for ex in examples]
+                    win_conds = []
+                    lose_conds = []
+                    for ex in examples:
+                        caption_val = ex.get("caption", "")
+                        if isinstance(caption_val, list):
+                            caption_val = caption_val[0] if caption_val else ""
+
+                        win_parts = [
+                            "win",
+                            cond_text(ex["win_aesthetic"], ex["lose_aesthetic"]),
+                            # cond_text(ex["win_pickscore"], ex["lose_pickscore"]),
+                            # cond_text(ex["win_hps_score"], ex["lose_hps_score"]),
+                        ]
+                        lose_parts = [
+                            "lose",
+                            cond_text(ex["lose_aesthetic"], ex["win_aesthetic"]),
+                            # cond_text(ex["lose_pickscore"], ex["win_pickscore"]),
+                            # cond_text(ex["lose_hps_score"], ex["win_hps_score"]),
+                        ]
+
+                        # Only include clip_score condition if caption isn't dropped
+                        if caption_val:
+                            win_parts.append(cond_text(ex["win_pickscore"], ex["lose_pickscore"]))
+                            win_parts.append(cond_text(ex["win_hps_score"], ex["lose_hps_score"]))
+                            win_parts.append(cond_text(ex["win_clip_score"], ex["lose_clip_score"]))
+
+                            lose_parts.append(cond_text(ex["lose_pickscore"], ex["win_pickscore"]))
+                            lose_parts.append(cond_text(ex["lose_hps_score"], ex["win_hps_score"]))
+                            lose_parts.append(cond_text(ex["lose_clip_score"], ex["win_clip_score"]))
+
+                        win_conds.append(" ".join(win_parts))
+                        lose_conds.append(" ".join(lose_parts))
+                    conds = win_conds + lose_conds
                 else:
                     conds = [f'win {cond_text(ex["win_mps_probs"], ex["lose_mps_probs"])} {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_mps_probs"], ex["win_mps_probs"])} {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
                 # conds = [f'win {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
@@ -1775,6 +1849,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=SAMPLE_GUIDANCE_SCALE,
                             generator=_gen,
+                            cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -1784,6 +1859,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=SAMPLE_GUIDANCE_SCALE2,
                             generator=_gen,
+                            cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -1793,6 +1869,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=1.0,
                             generator=_gen,
+                            cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -2114,7 +2191,7 @@ def main():
                             noisy_latents,
                             timesteps,
                             encoder_hidden_states, # TODO: only support SD1.5 for now
-                            cond_tokens
+                            torch.cat([cond_tokens, encoder_hidden_states], dim=1) if args.cond_with_prompt else cond_tokens
                         )
                 else:               
                 # Make the prediction from the model we're learning
@@ -2212,7 +2289,7 @@ def main():
                                         noisy_latents,
                                         timesteps,
                                         encoder_hidden_states,
-                                        cond_tokens
+                                        torch.cat([cond_tokens, encoder_hidden_states], dim=1) if args.cond_with_prompt else cond_tokens
                                     ).detach()
                                 else:
                                     ref_pred = ref_unet(
@@ -2254,6 +2331,8 @@ def main():
                         #     inside_term[bs:] *= 0.1
                         implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
                         loss = -1 * F.logsigmoid(inside_term).mean()
+                        if args.mse_loss_weight > 0:
+                            loss += args.mse_loss_weight * model_losses_w.mean()
                 #### END LOSS COMPUTATION ###
                     
                 # Gather the losses across all processes for logging 
@@ -2326,6 +2405,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=SAMPLE_GUIDANCE_SCALE,
                                     generator=_gen,
+                                    cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images
@@ -2335,6 +2415,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=SAMPLE_GUIDANCE_SCALE2,
                                     generator=_gen,
+                                    cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images
@@ -2344,6 +2425,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=1.0,
                                     generator=_gen,
+                                    cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images

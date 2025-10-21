@@ -118,7 +118,7 @@ class ProjPlusModel(torch.nn.Module):
 
 
 class IPAdapterFaceID:
-    def __init__(self, sd_pipe, ip_ckpt, device, lora_rank=128, num_tokens=4, torch_dtype=torch.float16):
+    def __init__(self, sd_pipe, ip_ckpt, device, lora_rank=128, num_tokens=77, torch_dtype=torch.float16):
         self.device = device
         self.ip_ckpt = ip_ckpt
         self.lora_rank = lora_rank

@@ -139,6 +139,7 @@ class IPAttnProcessor(nn.Module):
             encoder_hidden_states = hidden_states
         else:
             # get encoder_hidden_states, ip_hidden_states
+            # print(encoder_hidden_states.shape, "2", self.num_tokens)
             end_pos = encoder_hidden_states.shape[1] - self.num_tokens
             encoder_hidden_states, ip_hidden_states = (
                 encoder_hidden_states[:, :end_pos, :],
@@ -293,7 +294,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
             The context length of the image features.
     """
 
-    def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=4):
+    def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=77):
         super().__init__()
 
         if not hasattr(F, "scaled_dot_product_attention"):
@@ -348,8 +349,10 @@ class IPAttnProcessor2_0(torch.nn.Module):
             encoder_hidden_states = hidden_states
         else:
             # get encoder_hidden_states, ip_hidden_states
+            # print(encoder_hidden_states.shape, "4", self.num_tokens)
             num_tokens = self.num_tokens if encoder_hidden_states.shape[1] > 77 else 0
             if num_tokens > 0:
+                # print(encoder_hidden_states.shape, "1", self.num_tokens)
                 end_pos = encoder_hidden_states.shape[1] - self.num_tokens
                 encoder_hidden_states, ip_hidden_states = (
                     encoder_hidden_states[:, :end_pos, :],
@@ -442,7 +445,7 @@ class CNAttnProcessor:
     Default processor for performing attention-related computations.
     """
 
-    def __init__(self, num_tokens=4):
+    def __init__(self, num_tokens=77):
         self.num_tokens = num_tokens
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs,):
@@ -507,7 +510,7 @@ class CNAttnProcessor2_0:
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
     """
 
-    def __init__(self, num_tokens=4):
+    def __init__(self, num_tokens=77):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         self.num_tokens = num_tokens
@@ -551,6 +554,7 @@ class CNAttnProcessor2_0:
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         else:
+            # print(encoder_hidden_states.shape, "3", self.num_tokens)
             end_pos = encoder_hidden_states.shape[1] - self.num_tokens
             encoder_hidden_states = encoder_hidden_states[:, :end_pos]  # only use text
             if attn.norm_cross:

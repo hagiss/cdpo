@@ -64,7 +64,7 @@ class MLPProjModel(torch.nn.Module):
 
 
 class IPAdapter:
-    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4):
+    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=77):
         self.device = device
         self.image_encoder_path = image_encoder_path
         self.ip_ckpt = ip_ckpt
@@ -105,7 +105,7 @@ class IPAdapter:
                 block_id = int(name[len("down_blocks.")])
                 hidden_size = unet.config.block_out_channels[block_id]
             if cross_attention_dim is None:
-                attn_procs[name] = AttnProcessor()
+                attn_procs[name] = AttnProcessor(num_tokens=self.num_tokens)
             else:
                 attn_procs[name] = IPAttnProcessor(
                     hidden_size=hidden_size,

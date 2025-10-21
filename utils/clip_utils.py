@@ -21,8 +21,10 @@ class Selector():
     
     def __init__(self, device):
         self.device = device
+        clip_model_name = 'ViT-H-14'
         self.model, preprocess_train, self.preprocess_val = create_model_and_transforms(
-            'ViT-H-14',
+            # 'ViT-H-14',
+            clip_model_name,
             'laion2B-s32B-b79K',
             precision='amp',
             device=device,
@@ -42,7 +44,7 @@ class Selector():
         )
 
 
-        self.tokenizer = get_tokenizer('ViT-H-14')
+        self.tokenizer = get_tokenizer(clip_model_name)
 
 
     def score(self, img_path, prompt):

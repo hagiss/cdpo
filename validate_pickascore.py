@@ -336,7 +336,23 @@ def safe_import_selectors(device: str):
     except Exception as e:
         print(f"[WARN] CLIP selector unavailable: {e}")
 
-    return ps_selector, aes_selector, hps_selector, clip_selector
+    # ImageReward optional
+    imagereward_selector = None
+    try:
+        import ImageReward as RM
+        class ImageRewardSelector:
+            def __init__(self):
+                self.model = RM.load("ImageReward-v1.0")
+            
+            def score(self, images, prompt):
+                # Convert PIL images to the format ImageReward expects
+                return self.model.score(prompt, images)
+        
+        imagereward_selector = ImageRewardSelector()
+    except Exception as e:
+        print(f"[WARN] ImageReward selector unavailable: {e}")
+
+    return ps_selector, aes_selector, hps_selector, clip_selector, imagereward_selector
 
 
 def fmt_mean(sums, counts, idx: int):
@@ -352,7 +368,12 @@ def fmt_winrate(wins: Optional[int], losses: Optional[int]):
 
 def cmd_eval_folders(args: argparse.Namespace) -> None:
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
-    ps_selector, aes_selector, hps_selector, clip_selector = safe_import_selectors(device)
+    ps_selector, aes_selector, hps_selector, clip_selector, imagereward_selector = safe_import_selectors(device)
+
+    # Set default output path if not specified (same directory as baseline_folder parent)
+    if args.output is None:
+        parent_dir = os.path.dirname(os.path.abspath(args.dpo_folder))
+        args.output = os.path.join(parent_dir, 'results.txt')
 
     prompts = load_prompt_list_for_eval(args.prompts)
     base_paths = get_sorted_image_paths(args.baseline_folder)
@@ -371,6 +392,9 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
     hps_counts = [0, 0] if hps_selector is not None else None
     clip_sums = [0.0, 0.0] if clip_selector is not None else None
     clip_counts = [0, 0] if clip_selector is not None else None
+    clip_loss_indices = [] if clip_selector is not None else None
+    imagereward_sums = [0.0, 0.0] if imagereward_selector is not None else None
+    imagereward_counts = [0, 0] if imagereward_selector is not None else None
 
     ps_wins = 0
     ps_losses = 0
@@ -384,6 +408,9 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
     clip_wins = 0 if clip_selector is not None else None
     clip_losses = 0 if clip_selector is not None else None
     clip_ties = 0 if clip_selector is not None else None
+    imagereward_wins = 0 if imagereward_selector is not None else None
+    imagereward_losses = 0 if imagereward_selector is not None else None
+    imagereward_ties = 0 if imagereward_selector is not None else None
 
     for idx in range(n):
         prompt = prompts[idx]
@@ -459,43 +486,93 @@ def cmd_eval_folders(args: argparse.Namespace) -> None:
                         clip_wins += 1
                     elif base_clip > dpo_clip + 1e-8:
                         clip_losses += 1
+                        if clip_loss_indices is not None:
+                            clip_loss_indices.append(idx)
                     else:
                         clip_ties += 1
             except Exception as e:
                 print(f"[WARN] CLIP scoring failed at index {idx}: {e}")
 
+        # ImageReward
+        if imagereward_selector is not None:
+            try:
+                imagereward_scores = imagereward_selector.score(ims, prompt)
+                for i, s in enumerate(imagereward_scores[:2]):
+                    imagereward_sums[i] += float(s)
+                    imagereward_counts[i] += 1
+                if len(imagereward_scores) >= 2:
+                    base_imagereward = float(imagereward_scores[0])
+                    dpo_imagereward = float(imagereward_scores[1])
+                    if dpo_imagereward > base_imagereward + 1e-8:
+                        imagereward_wins += 1
+                    elif base_imagereward > dpo_imagereward + 1e-8:
+                        imagereward_losses += 1
+                    else:
+                        imagereward_ties += 1
+            except Exception as e:
+                print(f"[WARN] ImageReward scoring failed at index {idx}: {e}")
+
         if (idx + 1) % max(1, args.log_every) == 0:
             print(f"Scored {idx + 1}/{n}")
 
-    print("\n==== Mean scores across prompts ====")
-    print(f"PickScore mean - Baseline: {fmt_mean(ps_sums, ps_counts, 0)}, DPO: {fmt_mean(ps_sums, ps_counts, 1)}")
+    # Prepare results text
+    results_lines = []
+    results_lines.append("==== Mean scores across prompts ====")
+    results_lines.append(f"PickScore mean - Baseline: {fmt_mean(ps_sums, ps_counts, 0)}, DPO: {fmt_mean(ps_sums, ps_counts, 1)}")
     if aes_sums is not None:
-        print(f"AES mean - Baseline: {fmt_mean(aes_sums, aes_counts, 0)}, DPO: {fmt_mean(aes_sums, aes_counts, 1)}")
+        results_lines.append(f"AES mean - Baseline: {fmt_mean(aes_sums, aes_counts, 0)}, DPO: {fmt_mean(aes_sums, aes_counts, 1)}")
     else:
-        print("AES mean - skipped (AES selector unavailable)")
+        results_lines.append("AES mean - skipped (AES selector unavailable)")
     if hps_sums is not None:
-        print(f"HPS mean - Baseline: {fmt_mean(hps_sums, hps_counts, 0)}, DPO: {fmt_mean(hps_sums, hps_counts, 1)}")
+        results_lines.append(f"HPS mean - Baseline: {fmt_mean(hps_sums, hps_counts, 0)}, DPO: {fmt_mean(hps_sums, hps_counts, 1)}")
     else:
-        print("HPS mean - skipped (HPS selector unavailable)")
+        results_lines.append("HPS mean - skipped (HPS selector unavailable)")
     if clip_sums is not None:
-        print(f"CLIP mean - Baseline: {fmt_mean(clip_sums, clip_counts, 0)}, DPO: {fmt_mean(clip_sums, clip_counts, 1)}")
+        results_lines.append(f"CLIP mean - Baseline: {fmt_mean(clip_sums, clip_counts, 0)}, DPO: {fmt_mean(clip_sums, clip_counts, 1)}")
     else:
-        print("CLIP mean - skipped (CLIP selector unavailable)")
+        results_lines.append("CLIP mean - skipped (CLIP selector unavailable)")
+    if imagereward_sums is not None:
+        results_lines.append(f"ImageReward mean - Baseline: {fmt_mean(imagereward_sums, imagereward_counts, 0)}, DPO: {fmt_mean(imagereward_sums, imagereward_counts, 1)}")
+    else:
+        results_lines.append("ImageReward mean - skipped (ImageReward selector unavailable)")
 
-    print("\n==== Win rates (DPO vs Baseline) ====")
-    print(f"PickScore win-rate: {fmt_winrate(ps_wins, ps_losses)} (wins={ps_wins}, losses={ps_losses}, ties={ps_ties})")
+    results_lines.append("")
+    results_lines.append("==== Win rates (DPO vs Baseline) ====")
+    results_lines.append(f"PickScore win-rate: {fmt_winrate(ps_wins, ps_losses)} (wins={ps_wins}, losses={ps_losses}, ties={ps_ties})")
     if aes_sums is not None:
-        print(f"AES win-rate: {fmt_winrate(aes_wins, aes_losses)} (wins={aes_wins}, losses={aes_losses}, ties={aes_ties})")
+        results_lines.append(f"AES win-rate: {fmt_winrate(aes_wins, aes_losses)} (wins={aes_wins}, losses={aes_losses}, ties={aes_ties})")
     else:
-        print("AES win-rate - skipped (AES selector unavailable)")
+        results_lines.append("AES win-rate - skipped (AES selector unavailable)")
     if hps_sums is not None:
-        print(f"HPS win-rate: {fmt_winrate(hps_wins, hps_losses)} (wins={hps_wins}, losses={hps_losses}, ties={hps_ties})")
+        results_lines.append(f"HPS win-rate: {fmt_winrate(hps_wins, hps_losses)} (wins={hps_wins}, losses={hps_losses}, ties={hps_ties})")
     else:
-        print("HPS win-rate - skipped (HPS selector unavailable)")
+        results_lines.append("HPS win-rate - skipped (HPS selector unavailable)")
     if clip_sums is not None:
-        print(f"CLIP win-rate: {fmt_winrate(clip_wins, clip_losses)} (wins={clip_wins}, losses={clip_losses}, ties={clip_ties})")
+        results_lines.append(f"CLIP win-rate: {fmt_winrate(clip_wins, clip_losses)} (wins={clip_wins}, losses={clip_losses}, ties={clip_ties})")
     else:
-        print("CLIP win-rate - skipped (CLIP selector unavailable)")
+        results_lines.append("CLIP win-rate - skipped (CLIP selector unavailable)")
+    if imagereward_sums is not None:
+        results_lines.append(f"ImageReward win-rate: {fmt_winrate(imagereward_wins, imagereward_losses)} (wins={imagereward_wins}, losses={imagereward_losses}, ties={imagereward_ties})")
+    else:
+        results_lines.append("ImageReward win-rate - skipped (ImageReward selector unavailable)")
+
+    # Print to console
+    print()
+    for line in results_lines:
+        print(line)
+
+    # Save to file
+    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+    with open(args.output, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(results_lines) + '\n')
+    print(f"\nResults saved to: {args.output}")
+
+    if clip_loss_indices is not None:
+        output_dir = os.path.dirname(args.output) or '.'
+        indices_path = os.path.join(output_dir, 'clip_dpo_losses_indices.json')
+        with open(indices_path, 'w', encoding='utf-8') as f:
+            json.dump(clip_loss_indices, f)
+        print(f"Indices where baseline CLIP score was higher saved to: {indices_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -538,6 +615,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_e.add_argument('--prompts', type=str, required=True, help='Prompts file used for generation (.txt or .jsonl)')
     p_e.add_argument('--baseline-folder', type=str, required=True)
     p_e.add_argument('--dpo-folder', type=str, required=True)
+    p_e.add_argument('--output', type=str, default=None, help='Path to save evaluation results as text file (default: results.txt in parent dir of baseline-folder)')
     p_e.add_argument('--log-every', type=int, default=50)
     p_e.add_argument('--cpu', action='store_true')
     p_e.set_defaults(func=cmd_eval_folders)
