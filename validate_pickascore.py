@@ -52,9 +52,9 @@ def build_pipelines(
         pipe_base = StableDiffusionPipeline.from_pretrained(
             pretrained_model_name, torch_dtype=torch_dtype
         )
-        unet_id = "models/dpo-sd1.5"
-        unet = UNet2DConditionModel.from_pretrained(unet_id, subfolder="unet", torch_dtype=torch.float16)
-        pipe_base.unet = unet
+        # unet_id = "models/dpo-sd1.5"
+        # unet = UNet2DConditionModel.from_pretrained(unet_id, subfolder="unet", torch_dtype=torch.float16)
+        # pipe_base.unet = unet
 
     pipe_base = pipe_base.to(device)
     if disable_safety_checker:
