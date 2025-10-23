@@ -133,6 +133,17 @@ def normalize_hps(hps):
     norm = (hps - MIN_HPS) / (MAX_HPS - MIN_HPS)
     return int(round(norm * 100 + 1))
 
+def cond_text(sample1, sample2):
+    if random.random() < 0.2:
+        return 'tie'
+
+    if sample1 > sample2:
+        return 'win'
+    elif sample1 < sample2:
+        return 'lose'
+    else:
+        return 'tie'
+
 # def normalize_mps(mps):
 #     return mps
 
@@ -449,6 +460,7 @@ def parse_args():
     parser.add_argument("--cond_with_prompt", action='store_true', help="Condition with prompt")
     parser.add_argument("--csft_cond_only", action='store_true', help="In CSFT, freeze UNet and train only conditional adapter")
     parser.add_argument("--mse_loss_weight", type=float, default=0, help="Weight for model mse loss in DPO")
+    parser.add_argument("--dspo", action='store_true', help="Use DSPO loss")
     parser.add_argument("--ip_adapter", action='store_true', help="Use IP adapter")
     parser.add_argument("--ip_adapter_ckpt", type=str, default=None, help="Path to IP adapter checkpoint")
     parser.add_argument("--simultaneous_conditioning", action='store_true', help="Use simultaneous conditioning")
@@ -1290,13 +1302,6 @@ def main():
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
             if args.train_method == 'cdpo':
                 if args.multi_dim:
-                    def cond_text(sample1, sample2):
-                        if sample1 > sample2:
-                            return 'win'
-                        elif sample1 < sample2:
-                            return 'lose'
-                        else:
-                            return 'tie'
                     if has_all_scores:
                         win_conds = []
                         lose_conds = []
@@ -1327,6 +1332,15 @@ def main():
                                 lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
                                 lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
                                 lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"]))
+                            else:
+                                win_parts.append("tie")
+                                win_parts.append("tie")
+                                win_parts.append("tie")
+
+                                lose_parts.append("tie")
+                                lose_parts.append("tie")
+                                lose_parts.append("tie")
+                                
 
                             win_conds.append(" ".join(win_parts))
                             lose_conds.append(" ".join(lose_parts))
@@ -1571,13 +1585,6 @@ def main():
                 return_d["input_ids"] = torch.cat([ids, ids], dim=0)
             # Provide aligned condition texts: first half positive, second half negative
             if args.multi_dim:
-                def cond_text(sample1, sample2):
-                    if sample1 > sample2:
-                        return 'win'
-                    elif sample1 < sample2:
-                        return 'lose'
-                    else:
-                        return 'tie'
                 if has_all_scores:
                     win_conds = []
                     lose_conds = []
@@ -1608,6 +1615,14 @@ def main():
                             lose_parts.append(cond_text(ex["lose_pickscore"], ex["win_pickscore"]))
                             lose_parts.append(cond_text(ex["lose_hps_score"], ex["win_hps_score"]))
                             lose_parts.append(cond_text(ex["lose_clip_score"], ex["win_clip_score"]))
+                        else:
+                            win_parts.append("tie")
+                            win_parts.append("tie")
+                            win_parts.append("tie")
+
+                            lose_parts.append("tie")
+                            lose_parts.append("tie")
+                            lose_parts.append("tie")
 
                         win_conds.append(" ".join(win_parts))
                         lose_conds.append(" ".join(lose_parts))
@@ -2263,8 +2278,10 @@ def main():
                         model_diff = torch.cat([model_diff_w, model_diff_l], dim=0)
 
                     else:
-                        model_losses = (model_pred - target).pow(2).mean(dim=[1,2,3])
-                        model_losses_w, model_losses_l = model_losses.chunk(2)
+                        model_diff_w, model_diff_l = (model_pred - target).chunk(2)
+                        model_losses_w = model_diff_w.pow(2).mean(dim=[1,2,3])
+                        model_losses_l = model_diff_l.pow(2).mean(dim=[1,2,3])
+
                         # below for logging purposes
                         raw_model_loss = 0.5 * (model_losses_w.mean() + model_losses_l.mean())
                         
@@ -2330,9 +2347,13 @@ def main():
                         #     bs = inside_term.shape[0]//2
                         #     inside_term[bs:] *= 0.1
                         implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
-                        loss = -1 * F.logsigmoid(inside_term).mean()
-                        if args.mse_loss_weight > 0:
-                            loss += args.mse_loss_weight * model_losses_w.mean()
+                        if args.dspo:
+                            pred2, _ = (model_pred - ref_pred).chunk(2)
+                            loss = (model_diff_w - args.beta_dpo * (1 - F.sigmoid(inside_term)[:, None, None, None]) * pred2).pow(2).mean(dim=[1,2,3]).mean()
+                        else:
+                            loss = -1 * F.logsigmoid(inside_term).mean()
+                            if args.mse_loss_weight > 0:
+                                loss += args.mse_loss_weight * model_losses_w.mean()
                 #### END LOSS COMPUTATION ###
                     
                 # Gather the losses across all processes for logging 

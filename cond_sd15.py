@@ -806,6 +806,7 @@ def init_adapter(unet):
             }
             attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, num_tokens=77)
             attn_procs[name].load_state_dict(weights)
+            attn_procs[name].add_cross_attention_to_latent()
     unet.set_attn_processor(attn_procs)
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     return adapter_modules
@@ -968,10 +969,17 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                 device,
                 num_images_per_prompt,
                 do_classifier_free_guidance,
-                ["win win"] * half,
+                ["win win tie tie tie"] * half,
                 lora_scale=text_encoder_lora_scale,
             ).chunk(2)
-
+            partial_tie_cond_embeds, full_tie_cond_embeds = self._encode_prompt(
+                ["tie tie tie tie win"] * half,
+                device,
+                num_images_per_prompt,
+                do_classifier_free_guidance,
+                ["tie tie tie tie tie"] * half,
+                lora_scale=text_encoder_lora_scale,
+            ).chunk(2)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -1028,8 +1036,17 @@ def monkey_patch_sd15_pipeline_for_ipadapter(pipe):
                         text_win_pred = noise_pred_text
                         null_win_pred, text_lose_pred = noise_pred_rev.chunk(2)
 
-                        null_ref_pred = (null_lose_pred + null_win_pred) / 2
-                        text_ref_pred = (text_win_pred + text_lose_pred) / 2
+                        # use tie condition
+                        noise_pred_rev_tie = self.unet(
+                            latent_model_input,
+                            t,
+                            torch.cat([null_prompt_embeds, pos_prompt_embeds], dim=0),
+                            torch.cat([partial_tie_cond_embeds, full_tie_cond_embeds], dim=0)
+                        )
+                        null_tie_pred, text_tie_pred = noise_pred_rev_tie.chunk(2)
+
+                        null_ref_pred = (null_lose_pred + null_win_pred + null_tie_pred) / 3
+                        text_ref_pred = (text_win_pred + text_lose_pred + text_tie_pred) / 3
                         # noise_pred_text = 0.5 * (text_ref_pred - null_ref_pred) + 0.5 * (text_win_pred - text_lose_pred)
 
                         # beta = 0.5

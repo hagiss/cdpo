@@ -89,8 +89,8 @@ class IPAttnProcessor(nn.Module):
             The number of channels in the `encoder_hidden_states`.
         scale (`float`, defaults to 1.0):
             the weight scale of image prompt.
-        num_tokens (`int`, defaults to 77 as in SD1.5 text context length):
-            The context length of the image features.
+        num_tokens (`int`, defaults to 77):
+            The number of tokens of image prompt.
     """
 
     def __init__(self, hidden_size, cross_attention_dim=None, scale=1.0, num_tokens=77):
@@ -139,7 +139,6 @@ class IPAttnProcessor(nn.Module):
             encoder_hidden_states = hidden_states
         else:
             # get encoder_hidden_states, ip_hidden_states
-            # print(encoder_hidden_states.shape, "2", self.num_tokens)
             end_pos = encoder_hidden_states.shape[1] - self.num_tokens
             encoder_hidden_states, ip_hidden_states = (
                 encoder_hidden_states[:, :end_pos, :],
@@ -290,7 +289,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
             The number of channels in the `encoder_hidden_states`.
         scale (`float`, defaults to 1.0):
             the weight scale of image prompt.
-        num_tokens (`int`, defaults to 4 when do ip_adapter_plus it should be 16):
+        num_tokens (`int`, defaults to 77 when do ip_adapter_plus it should be 77):
             The context length of the image features.
     """
 
@@ -307,6 +306,50 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
         self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+        self.is_cross_attention_to_latent_added = False
+
+    def add_cross_attention_to_latent(self):
+        # self-attention layers for conditioning fusion
+        self.norm_sa = nn.LayerNorm(self.cross_attention_dim)
+        self.to_q_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
+        self.to_k_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
+        self.to_v_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
+        self.to_out_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim)
+        
+        # cross-attention layers for conditioning -> latent interaction
+        self.norm_ip_ca = nn.LayerNorm(self.cross_attention_dim)
+        self.norm_hidden_states_ca = nn.LayerNorm(self.hidden_size)
+        self.to_q_ca = nn.Linear(self.cross_attention_dim, self.hidden_size, bias=False)
+        self.to_k_ca = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.to_v_ca = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.to_out_ca = nn.Linear(self.hidden_size, self.cross_attention_dim)
+        
+        # MLP for self-attention
+        self.norm_mlp_sa = nn.LayerNorm(self.cross_attention_dim)
+        self.ff_sa = nn.Sequential(
+            nn.Linear(self.cross_attention_dim, self.cross_attention_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.cross_attention_dim * 4, self.cross_attention_dim),
+        )
+
+        # MLP for cross-attention
+        self.norm_mlp_ca = nn.LayerNorm(self.cross_attention_dim)
+        self.ff_ca = nn.Sequential(
+            nn.Linear(self.cross_attention_dim, self.cross_attention_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.cross_attention_dim * 4, self.cross_attention_dim),
+        )
+
+        # init outputs with zeros
+        self.to_out_sa.weight.data.zero_()
+        self.to_out_sa.bias.data.zero_()
+        self.to_out_ca.weight.data.zero_()
+        self.to_out_ca.bias.data.zero_()
+        self.ff_sa[-1].weight.data.zero_()
+        self.ff_sa[-1].bias.data.zero_()
+        self.ff_ca[-1].weight.data.zero_()
+        self.ff_ca[-1].bias.data.zero_()
+        self.is_cross_attention_to_latent_added = True
 
     def __call__(
         self,
@@ -383,11 +426,76 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
         # for ip-adapter
         if num_tokens > 0:
+
+            if self.is_cross_attention_to_latent_added:
+                # 1. Self-Attention for ip_hidden_states and encoder_hidden_states fusion
+                orig_ip_len = ip_hidden_states.shape[1]
+                orig_enc_len = encoder_hidden_states.shape[1]
+                
+                fused_states = torch.cat([ip_hidden_states, encoder_hidden_states], dim=1)
+                
+                norm_fused_states = self.norm_sa(fused_states)
+                q_sa = self.to_q_sa(norm_fused_states)
+                k_sa = self.to_k_sa(norm_fused_states)
+                v_sa = self.to_v_sa(norm_fused_states)
+
+                # Reshape for attention
+                sa_head_dim = self.cross_attention_dim // attn.heads
+                q_sa = q_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
+                k_sa = k_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
+                v_sa = v_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
+
+                # Perform attention
+                fused_attn_out = F.scaled_dot_product_attention(
+                    q_sa, k_sa, v_sa, attn_mask=None, dropout_p=0.0, is_causal=False
+                )
+
+                # Reshape and project out
+                fused_attn_out = fused_attn_out.transpose(1, 2).reshape(batch_size, -1, self.cross_attention_dim)
+                fused_attn_out = self.to_out_sa(fused_attn_out)
+
+                # Residual connection and split back
+                fused_states = fused_states + fused_attn_out
+                # MLP block for self-attention
+                fused_states = fused_states + self.ff_sa(self.norm_mlp_sa(fused_states))
+                ip_hidden_states, encoder_hidden_states = torch.split(fused_states, [orig_ip_len, orig_enc_len], dim=1)
+                
+                # 2. Cross-Attention between fused conditioning and latents
+                query_ca = self.to_q_ca(self.norm_ip_ca(ip_hidden_states))
+                
+                # K, V from hidden_states (latents)
+                norm_hidden_states_ca = self.norm_hidden_states_ca(hidden_states)
+                key_ca = self.to_k_ca(norm_hidden_states_ca)
+                value_ca = self.to_v_ca(norm_hidden_states_ca)
+
+                # Reshape for attention
+                head_dim = self.hidden_size // attn.heads
+                query_ca = query_ca.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                key_ca = key_ca.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+                value_ca = value_ca.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+                # 3. Perform attention
+                ip_hidden_states_ca = F.scaled_dot_product_attention(
+                    query_ca, key_ca, value_ca, attn_mask=None, dropout_p=0.0, is_causal=False
+                )
+
+                # 4. Reshape and project out
+                ip_hidden_states_ca = ip_hidden_states_ca.transpose(1, 2).reshape(batch_size, -1, self.hidden_size)
+                ip_hidden_states_ca = self.to_out_ca(ip_hidden_states_ca)
+                
+                # 5. Add residual connection
+                ip_hidden_states = ip_hidden_states + ip_hidden_states_ca
+                # MLP block for cross-attention
+                ip_hidden_states = ip_hidden_states + self.ff_ca(self.norm_mlp_ca(ip_hidden_states))
+                
             ip_key = self.to_k_ip(ip_hidden_states)
             ip_value = self.to_v_ip(ip_hidden_states)
 
             ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
             ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+            # query = attn.to_q(hidden_states)
+            # query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
             # the output of sdp = (batch, num_heads, seq_len, head_dim)
             # TODO: add support for attn.scale when we move to Torch 2.1
@@ -396,7 +504,6 @@ class IPAttnProcessor2_0(torch.nn.Module):
             )
             with torch.no_grad():
                 self.attn_map = query @ ip_key.transpose(-2, -1).softmax(dim=-1)
-                #print(self.attn_map.shape)
 
             ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
             ip_hidden_states = ip_hidden_states.to(query.dtype)
