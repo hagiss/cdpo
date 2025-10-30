@@ -309,12 +309,14 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.is_cross_attention_to_latent_added = False
 
     def add_cross_attention_to_latent(self):
+        self.cond_hidden_size = self.cross_attention_dim if self.cross_attention_dim != 2048 else self.hidden_size
+        self.mlp_hidden_dim = self.cross_attention_dim if self.cross_attention_dim != 2048 else 768*4
         # self-attention layers for conditioning fusion
         self.norm_sa = nn.LayerNorm(self.cross_attention_dim)
-        self.to_q_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
-        self.to_k_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
-        self.to_v_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim, bias=False)
-        self.to_out_sa = nn.Linear(self.cross_attention_dim, self.cross_attention_dim)
+        self.to_q_sa = nn.Linear(self.cross_attention_dim, self.cond_hidden_size, bias=False)
+        self.to_k_sa = nn.Linear(self.cross_attention_dim, self.cond_hidden_size, bias=False)
+        self.to_v_sa = nn.Linear(self.cross_attention_dim, self.cond_hidden_size, bias=False)
+        self.to_out_sa = nn.Linear(self.cond_hidden_size, self.cross_attention_dim)
         
         # cross-attention layers for conditioning -> latent interaction
         self.norm_ip_ca = nn.LayerNorm(self.cross_attention_dim)
@@ -325,19 +327,19 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.to_out_ca = nn.Linear(self.hidden_size, self.cross_attention_dim)
         
         # MLP for self-attention
-        self.norm_mlp_sa = nn.LayerNorm(self.cross_attention_dim)
-        self.ff_sa = nn.Sequential(
-            nn.Linear(self.cross_attention_dim, self.cross_attention_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.cross_attention_dim * 4, self.cross_attention_dim),
-        )
+        # self.norm_mlp_sa = nn.LayerNorm(self.cross_attention_dim)
+        # self.ff_sa = nn.Sequential(
+        #     nn.Linear(self.cross_attention_dim, self.mlp_hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(self.mlp_hidden_dim, self.cross_attention_dim),
+        # )
 
         # MLP for cross-attention
         self.norm_mlp_ca = nn.LayerNorm(self.cross_attention_dim)
         self.ff_ca = nn.Sequential(
-            nn.Linear(self.cross_attention_dim, self.cross_attention_dim * 4),
+            nn.Linear(self.cross_attention_dim, self.mlp_hidden_dim),
             nn.GELU(),
-            nn.Linear(self.cross_attention_dim * 4, self.cross_attention_dim),
+            nn.Linear(self.mlp_hidden_dim, self.cross_attention_dim),
         )
 
         # init outputs with zeros
@@ -345,8 +347,8 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.to_out_sa.bias.data.zero_()
         self.to_out_ca.weight.data.zero_()
         self.to_out_ca.bias.data.zero_()
-        self.ff_sa[-1].weight.data.zero_()
-        self.ff_sa[-1].bias.data.zero_()
+        # self.ff_sa[-1].weight.data.zero_()
+        # self.ff_sa[-1].bias.data.zero_()
         self.ff_ca[-1].weight.data.zero_()
         self.ff_ca[-1].bias.data.zero_()
         self.is_cross_attention_to_latent_added = True
@@ -439,8 +441,9 @@ class IPAttnProcessor2_0(torch.nn.Module):
                 k_sa = self.to_k_sa(norm_fused_states)
                 v_sa = self.to_v_sa(norm_fused_states)
 
-                # Reshape for attention
-                sa_head_dim = self.cross_attention_dim // attn.heads
+                # Reshape for SA attention
+                inner_dim = k_sa.shape[-1]
+                sa_head_dim = inner_dim // attn.heads
                 q_sa = q_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
                 k_sa = k_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
                 v_sa = v_sa.view(batch_size, -1, attn.heads, sa_head_dim).transpose(1, 2)
@@ -451,13 +454,13 @@ class IPAttnProcessor2_0(torch.nn.Module):
                 )
 
                 # Reshape and project out
-                fused_attn_out = fused_attn_out.transpose(1, 2).reshape(batch_size, -1, self.cross_attention_dim)
+                fused_attn_out = fused_attn_out.transpose(1, 2).reshape(batch_size, -1, self.cond_hidden_size)
                 fused_attn_out = self.to_out_sa(fused_attn_out)
 
                 # Residual connection and split back
                 fused_states = fused_states + fused_attn_out
                 # MLP block for self-attention
-                fused_states = fused_states + self.ff_sa(self.norm_mlp_sa(fused_states))
+                # fused_states = fused_states + self.ff_sa(self.norm_mlp_sa(fused_states))
                 ip_hidden_states, encoder_hidden_states = torch.split(fused_states, [orig_ip_len, orig_enc_len], dim=1)
                 
                 # 2. Cross-Attention between fused conditioning and latents

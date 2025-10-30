@@ -51,6 +51,8 @@ from diffusers.utils.import_utils import is_xformers_available
 
 # Conditional SD1.5 adapter (monkey patch 1)
 from cond_sd15 import SD15ConditionAdapter, monkey_patch_sd15_pipeline_for_condition, monkey_patch_sd15_pipeline_for_ipadapter, IPAdapter, init_adapter
+# TODO: SDXL CSFT/CDPO - Import SDXL equivalents
+from cond_sdxl import SDXLConditionAdapter, IPAdapter_SDXL, init_adapter_SDXL, monkey_patch_sdxl_pipeline_for_ipadapter
 
 if is_wandb_available():
     import wandb
@@ -133,8 +135,8 @@ def normalize_hps(hps):
     norm = (hps - MIN_HPS) / (MAX_HPS - MIN_HPS)
     return int(round(norm * 100 + 1))
 
-def cond_text(sample1, sample2):
-    if random.random() < 0.2:
+def cond_text(sample1, sample2, drop_prob=0.2):
+    if random.random() < drop_prob:
         return 'tie'
 
     if sample1 > sample2:
@@ -448,6 +450,12 @@ def parse_args():
     parser.add_argument(
         "--streaming", action="store_true", help="Use streaming mode to avoid downloading entire dataset (saves disk space)"
     )
+    parser.add_argument(
+        "--streaming_reset_every_n_steps",
+        type=int,
+        default=0,
+        help="If > 0 and using streaming, reset dataloader every N steps to simulate epochs."
+    )
     # Conditional training/inference (SD1.5)
     parser.add_argument("--train_method", type=str, default=None, choices=["sft", "dpo", "csft", "cdpo"], help="Training method: sft/dpo/csft/cdpo")
     parser.add_argument("--csft", action='store_true', help="Alias for --train_method csft")
@@ -466,6 +474,7 @@ def parse_args():
     parser.add_argument("--simultaneous_conditioning", action='store_true', help="Use simultaneous conditioning")
     parser.add_argument("--jeremy_conditioning", action='store_true', help="Use Jeremy conditioning")
     parser.add_argument("--class_conditioning", action='store_true', help="Add learned class embeddings for win/lose conditions")
+    parser.add_argument("--original_ref", action='store_true', help="Use original ref")
     parser.add_argument("--multi_dim", action='store_true', help="Use multi-dimensional conditioning")
     # Initialize conditional adapter from a previous run (e.g., trained with --csft_cond_only)
     parser.add_argument(
@@ -549,6 +558,53 @@ def encode_prompt_sdxl(batch, text_encoders, tokenizers, proportion_empty_prompt
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
+
+
+def encode_condition_sdxl(cond_texts, text_encoders, tokenizers):
+    """
+    Encode condition texts (e.g., "win", "lose") for SDXL using BOTH text encoders.
+    
+    Following SDXL's architecture, we use both text_encoder_1 (768 dim) and 
+    text_encoder_2 (1280 dim) and concatenate them to get 2048 dim embeddings.
+    This matches how prompts are encoded in SDXL.
+    
+    Args:
+        cond_texts: List of condition text strings [2*B] (win + lose conditions)
+        text_encoders: List of SDXL text encoders [text_encoder_1, text_encoder_2]
+        tokenizers: List of SDXL tokenizers [tokenizer_1, tokenizer_2]
+    
+    Returns:
+        cond_embeds: Condition embeddings [2*B, seq_len, 2048] (768 + 1280 concatenated)
+    """
+    prompt_embeds_list = []
+    
+    with torch.no_grad():
+        # Encode with both text encoders, just like encode_prompt_sdxl does
+        for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+            text_inputs = tokenizer(
+                cond_texts,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs.input_ids
+            outputs = text_encoder(
+                text_input_ids.to('cuda'),
+                output_hidden_states=True,
+            )
+            
+            # Use hidden states (not pooled) to maintain sequence dimension
+            prompt_embeds = outputs.hidden_states[-2]
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+    
+    # Concatenate embeddings from both encoders along the last dimension
+    # Result: [B, seq_len, 768 + 1280] = [B, seq_len, 2048]
+    cond_embeds = torch.concat(prompt_embeds_list, dim=-1)
+    
+    return cond_embeds
 
 
 
@@ -643,6 +699,7 @@ def main():
         tokenizer_two = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer_2", revision=args.revision, use_fast=False
         )
+        tokenizer = tokenizer_one
     else:
         tokenizer = CLIPTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -743,6 +800,26 @@ def main():
                 print(f"Initialized conditional adapter from '{load_dir}'")
             except Exception as e:
                 logger.warning(f"Failed to initialize conditional adapter from '{load_dir}': {e}")
+    elif args.sdxl and args.train_method in ["csft", "cdpo"]:
+        # SDXL uses two text encoders: text_encoder_1 (768) + text_encoder_2 (1280)
+        # We concatenate both embeddings, so hidden_size = 768 + 1280 = 2048
+        cond_adapter = SDXLConditionAdapter(
+            hidden_size=2048,  # 768 (text_encoder_1) + 1280 (text_encoder_2)
+            projector_type=args.cond_projector_type,
+            mlp_hidden_dim=args.cond_mlp_hidden_dim,
+            num_condition_tokens=args.cond_num_tokens,
+        )
+        if args.cond_adapter_init:
+            load_dir = args.cond_adapter_init
+            candidate = os.path.join(load_dir, "cond_adapter")
+            if os.path.isdir(candidate):
+                load_dir = candidate
+            try:
+                loaded_adapter = SDXLConditionAdapter.from_pretrained(load_dir)
+                cond_adapter = loaded_adapter
+                print(f"Initialized conditional adapter from '{load_dir}'")
+            except Exception as e:
+                logger.warning(f"Failed to initialize conditional adapter from '{load_dir}': {e}")
 
     # Freeze vae, text_encoder(s), reference unet
     vae.requires_grad_(False)
@@ -755,12 +832,23 @@ def main():
     if args.csft_cond_only:
         unet.requires_grad_(False)
 
+    # Enable gradient checkpointing BEFORE wrapping with IPAdapter
+    # This must be done before IPAdapter wrapping to ensure the underlying UNet has it enabled
+    if args.gradient_checkpointing or args.sdxl:
+        print("Enabling gradient checkpointing on UNet, either because you asked for this or because you're using SDXL")
+        unet.enable_gradient_checkpointing()
+    
     if args.ip_adapter:
-        adapter_modules = init_adapter(unet)
-        unet = IPAdapter(unet, cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module, adapter_modules, args.ip_adapter_ckpt)
+        if args.sdxl:
+            adapter_modules = init_adapter_SDXL(unet)
+            unet = IPAdapter_SDXL(unet, cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module, adapter_modules, args.ip_adapter_ckpt)
+        else:
+            adapter_modules = init_adapter(unet)
+            unet = IPAdapter(unet, cond_adapter if not hasattr(cond_adapter, "module") else cond_adapter.module, adapter_modules, args.ip_adapter_ckpt)
+    
 
     if args.train_method in ['dpo', 'cdpo']:
-        if args.train_method == "cdpo":
+        if args.train_method == "cdpo" and not args.original_ref:
             import copy
             ref_unet = copy.deepcopy(unet)
             print("!!!!!!!!!!!!!Ref UNet copied!!!!!!!!!!!!!!!")
@@ -812,12 +900,19 @@ def main():
                     unwrapped.save_pretrained(os.path.join(output_dir, "unet"))
                 elif isinstance(unwrapped, SD15ConditionAdapter):
                     unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
+                # TODO: SDXL CSFT/CDPO - Add save support for SDXLConditionAdapter
+                elif isinstance(unwrapped, SDXLConditionAdapter):
+                    unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
                 elif isinstance(unwrapped, IPAdapter):
+                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
+                # TODO: SDXL CSFT/CDPO - Add save support for IPAdapter_SDXL
+                elif isinstance(unwrapped, IPAdapter_SDXL):
                     unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
                 if len(weights) > 0:
                     weights.pop()
 
         def load_model_hook(models, input_dir):
+            # TODO: SDXL CSFT/CDPO - Add load support for SDXLConditionAdapter and IPAdapter_SDXL
             # Pop models to signal we've handled loading. Unwrap to access real modules.
             for _ in range(len(models)):
                 model = models.pop()
@@ -833,18 +928,27 @@ def main():
                         unwrapped.load_state_dict(load_adapter.state_dict())
                     except Exception:
                         pass
+                # TODO: SDXL CSFT/CDPO - Add loading logic for SDXLConditionAdapter
+                elif isinstance(unwrapped, SDXLConditionAdapter):
+                    try:
+                        load_adapter = SDXLConditionAdapter.from_pretrained(os.path.join(input_dir, "cond_adapter"))
+                        unwrapped.load_state_dict(load_adapter.state_dict())
+                    except Exception:
+                        pass
                 elif isinstance(unwrapped, IPAdapter):
                     # load_adapter = IPAdapter.load_from_checkpoint(os.path.join(input_dir, "ip_adapter"))
                     # unwrapped.load_state_dict(load_adapter.state_dict())
                     # del load_adapter
                     print("Loading IPAdapter should be conducted with ip_adapter_ckpt")
+                # TODO: SDXL CSFT/CDPO - Add loading logic for IPAdapter_SDXL
+                elif isinstance(unwrapped, IPAdapter_SDXL):
+                    print("Loading IPAdapter_SDXL should be conducted with ip_adapter_ckpt")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if args.gradient_checkpointing or args.sdxl: #  (args.sdxl and ('turbo' not in args.pretrained_model_name_or_path) ):
-        print("Enabling gradient checkpointing, either because you asked for this or because you're using SDXL")
-        unet.enable_gradient_checkpointing()
+    # Note: Gradient checkpointing is now enabled earlier (before IPAdapter wrapping)
+    # See lines ~835-837 above
 
     # Bram Note: haven't touched
     # Enable TF32 for faster training on Ampere GPUs,
@@ -885,6 +989,7 @@ def main():
                                            clip_threshold=1.0,
                                            scale_parameter=False,
                                           relative_step=False)
+
     else:
         optimizer = torch.optim.AdamW(
             optim_params,
@@ -894,8 +999,6 @@ def main():
             eps=args.adam_epsilon,
         )
 
-        
-        
         
     # Load scores mapping if provided
     scores_mapping = None
@@ -1153,6 +1256,9 @@ def main():
                 # if '__key__' in examples:
                 #     print(f"DEBUG: __key__ sample: {examples['__key__'][:2] if len(examples.get('__key__', [])) >= 2 else examples.get('__key__')}")
                 
+                # labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
+                # # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
+                # labels = [int(labels[i]) for i in range(len(labels))]
                 examples_mapped = {
                     'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
                     'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
@@ -1285,10 +1391,10 @@ def main():
                 examples["lose_vila_scores"] = lose_vila
                 examples["pixel_values"] = combined_pixel_values
             # SDXL takes raw prompts; for SD1.5 also store dropped captions for conditioning logic
-            if not args.sdxl:
-                _input_ids, _captions = tokenize_captions(examples)
-                examples["input_ids"] = _input_ids
-                examples["caption"] = _captions
+            # if not args.sdxl:
+            _input_ids, _captions = tokenize_captions(examples)
+            examples["input_ids"] = _input_ids
+            examples["caption"] = _captions
             return examples
 
         def collate_fn(examples):
@@ -1296,10 +1402,10 @@ def main():
             pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
             return_d =  {"pixel_values": pixel_values}
             # SDXL takes raw prompts
-            if args.sdxl:
-                return_d["caption"] = [example["caption"] for example in examples]
-            else:
-                return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
+            # if args.sdxl:
+            #     return_d["caption"] = [example["caption"] for example in examples]
+            # else:
+            return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
             if args.train_method == 'cdpo':
                 if args.multi_dim:
                     if has_all_scores:
@@ -1312,13 +1418,13 @@ def main():
 
                             win_parts = [
                                 "win",
-                                cond_text(example["win_aesthetic"], example["lose_aesthetic"]),
+                                cond_text(example["win_aesthetic"], example["lose_aesthetic"], drop_prob=0.25),
                                 # cond_text(example["win_pickscore"], example["lose_pickscore"]),
                                 # cond_text(example["win_hps_score"], example["lose_hps_score"]),
                             ]
                             lose_parts = [
                                 "lose",
-                                cond_text(example["lose_aesthetic"], example["win_aesthetic"]),
+                                cond_text(example["lose_aesthetic"], example["win_aesthetic"], drop_prob=0.25),
                                 # cond_text(example["lose_pickscore"], example["win_pickscore"]),
                                 # cond_text(example["lose_hps_score"], example["win_hps_score"]),
                             ]
@@ -1327,11 +1433,11 @@ def main():
                             if caption_val:
                                 win_parts.append(cond_text(example["win_pickscore"], example["lose_pickscore"]))
                                 win_parts.append(cond_text(example["win_hps_score"], example["lose_hps_score"]))
-                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"]))
+                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.05))
                                 
                                 lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
                                 lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
-                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"]))
+                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.05))
                             else:
                                 win_parts.append("tie")
                                 win_parts.append("tie")
@@ -1347,8 +1453,14 @@ def main():
                     else:
                         win_conds = [f'win {cond_text(example["win_mps_probs"], example["lose_mps_probs"])} {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples]
                         lose_conds = [f'lose {cond_text(example["lose_mps_probs"], example["win_mps_probs"])} {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
-                    # conds = [f'win {cond_text(example["win_vqa_scores"], example["lose_vqa_scores"])} {cond_text(example["win_vila_scores"], example["lose_vila_scores"])}' for example in examples] + [f'lose {cond_text(example["lose_vqa_scores"], example["win_vqa_scores"])} {cond_text(example["lose_vila_scores"], example["win_vila_scores"])}' for example in examples]
+
                     # print(win_conds[0], lose_conds[0])
+                    conds = win_conds + lose_conds
+                    # if args.sdxl:
+                    #     return_d["win_conds"] = win_conds
+                    #     return_d["lose_conds"] = lose_conds
+                    #     return_d["conds"] = conds
+                    # else:
                     # Tokenize win and lose conditions separately, then stack along dimension 1
                     win_cond_input_ids = tokenizer(win_conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
                     lose_cond_input_ids = tokenizer(lose_conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
@@ -1366,6 +1478,7 @@ def main():
                     cond_input_ids = tokenizer(conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
                     # Store condition flags as tensor: 1 for positive/win text, 0 for negative/lose text
                     cond_is_positive = torch.tensor([1 if c == args.cond_positive_text else 0 for c in conds], dtype=torch.long)
+                # if not args.sdxl:
                 return_d["cond_input_ids"] = cond_input_ids
                 return_d["cond_is_positive"] = cond_is_positive
                 
@@ -1426,10 +1539,13 @@ def main():
             # Handle WebDataset format column names in streaming mode
             if args.streaming and 'jpg_0.jpg' in examples:
                 # Map WebDataset columns to expected names
+                labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
+                # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
+                labels = [int(labels[i]) for i in range(len(labels))]
                 examples_mapped = {
                     'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
                     'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
-                    'label_0': [int(float(x.decode('utf-8') if isinstance(x, bytes) else x)) for x in examples.get('label_0.txt', examples.get('label_0', []))],
+                    'label_0': labels,
                     'caption': [x.decode('utf-8') if isinstance(x, bytes) else x for x in examples.get('original_prompt.txt', examples.get('caption', []))],
                 }
                 
@@ -1546,12 +1662,12 @@ def main():
                     captions.append(cap)
             examples["pixel_values_win"] = [train_transforms(img) for img in win_images]
             examples["pixel_values_lose"] = [train_transforms(img) for img in lose_images]
-            if not args.sdxl:
-                _input_ids, _captions = tokenize_captions({caption_column: captions})
-                examples["input_ids"] = _input_ids
-                examples["caption"] = _captions
-            else:
-                examples["caption"] = captions
+            # if not args.sdxl:
+            _input_ids, _captions = tokenize_captions({caption_column: captions})
+            examples["input_ids"] = _input_ids
+            examples["caption"] = _captions
+            # else:
+            #     examples["caption"] = captions
             if args.multi_dim:
                 if has_all_scores:
                     examples["win_pickscore"] = win_pickscore
@@ -1577,12 +1693,12 @@ def main():
             pixel_values = torch.cat([win, lose], dim=0)
             pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
             return_d = {"pixel_values": pixel_values}
-            if args.sdxl:
-                caps = [ex["caption"] for ex in examples]
-                return_d["caption"] = caps + caps
-            else:
-                ids = torch.stack([ex["input_ids"] for ex in examples])
-                return_d["input_ids"] = torch.cat([ids, ids], dim=0)
+            # if args.sdxl:
+            #     caps = [ex["caption"] for ex in examples]
+            #     return_d["caption"] = caps + caps
+            # else:
+            ids = torch.stack([ex["input_ids"] for ex in examples])
+            return_d["input_ids"] = torch.cat([ids, ids], dim=0)
             # Provide aligned condition texts: first half positive, second half negative
             if args.multi_dim:
                 if has_all_scores:
@@ -1627,15 +1743,27 @@ def main():
                         win_conds.append(" ".join(win_parts))
                         lose_conds.append(" ".join(lose_parts))
                     conds = win_conds + lose_conds
+                    # if args.sdxl:
+                    #     return_d["win_conds"] = win_conds
+                    #     return_d["lose_conds"] = lose_conds
+                    #     return_d["conds"] = conds
                 else:
                     conds = [f'win {cond_text(ex["win_mps_probs"], ex["lose_mps_probs"])} {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_mps_probs"], ex["win_mps_probs"])} {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
                 # conds = [f'win {cond_text(ex["win_vqa_scores"], ex["lose_vqa_scores"])} {cond_text(ex["win_vila_scores"], ex["lose_vila_scores"])}' for ex in examples] + [f'lose {cond_text(ex["lose_vqa_scores"], ex["win_vqa_scores"])} {cond_text(ex["lose_vila_scores"], ex["win_vila_scores"])}' for ex in examples]
                 # print(conds[0], conds[-1])
             else:
                 conds = [args.cond_positive_text for _ in examples] + [args.cond_negative_text for _ in examples]
-            # Tokenize condition texts to avoid string concatenation issues with Accelerate
+            
+            # Handle condition text preparation based on model type
+            # if not args.sdxl:
+            # SD1.5: Tokenize condition texts in collate (CPU)
             cond_input_ids = tokenizer(conds, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids
             return_d["cond_input_ids"] = cond_input_ids
+            # else:
+            #     # SDXL: Return raw condition text strings, will encode in training loop (GPU)
+            #     # This matches how SDXL handles captions - defer tokenization/encoding to GPU
+            #     if args.train_method in ['csft', 'cdpo']:
+            #         return_d["cond_texts"] = conds
             return return_d
     #### END PREPROCESSING/COLLATION ####
     
@@ -1706,7 +1834,11 @@ def main():
                 "When using --streaming, you must specify --max_train_steps "
                 "since streaming datasets don't have a known length."
             )
-        num_update_steps_per_epoch = args.max_train_steps  # Dummy value for streaming
+        if args.streaming_reset_every_n_steps > 0:
+            logger.info(f"Streaming mode with reset: will reset dataloader every {args.streaming_reset_every_n_steps} steps.")
+            num_update_steps_per_epoch = args.streaming_reset_every_n_steps
+        else:
+            num_update_steps_per_epoch = args.max_train_steps  # Dummy value for streaming
         logger.info(f"Streaming mode: using max_train_steps={args.max_train_steps}")
     else:
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1775,8 +1907,12 @@ def main():
         # Afterwards we recalculate our number of training epochs
         args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     else:
-        # For streaming, we already set max_train_steps and can't calculate epochs
-        logger.info(f"Streaming mode: training for {args.max_train_steps} steps")
+        # For streaming, we already set max_train_steps and can't calculate epochs unless we reset
+        if args.streaming_reset_every_n_steps > 0:
+            args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+            logger.info(f"Streaming mode with reset: training for {args.max_train_steps} steps across {args.num_train_epochs} epochs")
+        else:
+            logger.info(f"Streaming mode: training for {args.max_train_steps} steps")
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -1823,6 +1959,18 @@ def main():
                             )
                     except Exception as e:
                         logger.warning(f"Conditional CFG monkey-patch failed; proceeding to sample without conditional tokens. Error: {e}")
+            
+            # TODO: SDXL CSFT/CDPO - Add SDXL conditional monkey patch for sampling during training
+            if args.sdxl and (cond_adapter is not None) and (args.train_method in ["csft", "cdpo"]):
+                try:
+                    if args.ip_adapter:
+                        print("Applying IPAdapter monkey patch for SDXL")
+                        monkey_patch_sdxl_pipeline_for_ipadapter(sample_pipe_local)
+                    # else:
+                    #     # TODO: implement monkey_patch_sdxl_pipeline_for_condition if needed
+                    #     pass
+                except Exception as e:
+                    logger.warning(f"SDXL conditional monkey-patch failed; proceeding to sample without conditional tokens. Error: {e}")
             # swap in current training UNet
             sample_pipe_local.unet = unet_infer
             try:
@@ -1838,8 +1986,8 @@ def main():
             sample_pipe.to(accelerator.device, torch_dtype=unet_dtype)
 
     # Generate an initial qualitative sample before training starts (main process only)
-    if accelerator.is_main_process:
-        _build_or_update_sample_pipeline()
+    if accelerator.is_main_process and False:
+        # _build_or_update_sample_pipeline()
         # Log a quick weight checksum to verify training updates over time
         try:
             _unet_chk = next(accelerator.unwrap_model(unet).parameters()).detach().float()
@@ -1849,12 +1997,20 @@ def main():
         with torch.inference_mode():
             _gen = torch.Generator(device=accelerator.device).manual_seed(args.seed)
             if args.sdxl:
-                images = sample_pipe(
-                    prompt=SAMPLE_PROMPTS,
-                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
-                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
-                    generator=_gen,
-                ).images
+                sample_kwargs = {
+                    "prompt": SAMPLE_PROMPTS,
+                    "num_inference_steps": SAMPLE_INFERENCE_STEPS,
+                    "guidance_scale": SAMPLE_GUIDANCE_SCALE,
+                    "generator": _gen,
+                }
+                # Add condition tokens for CSFT/CDPO sampling
+                if args.ip_adapter and args.train_method in ['csft', 'cdpo']:
+                    sample_kwargs["positive_condition"] = args.cond_positive_text
+                    sample_kwargs["negative_condition"] = args.cond_negative_text
+                    sample_kwargs["self"] = sample_pipe
+                    images = sample_pipe.__call__(**sample_kwargs).images
+                else:
+                    images = sample_pipe(**sample_kwargs).images
             else:
                 try:
                     if args.ip_adapter:
@@ -1864,7 +2020,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=SAMPLE_GUIDANCE_SCALE,
                             generator=_gen,
-                            cond_with_prompt=args.cond_with_prompt,
+                            # cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -1874,7 +2030,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=SAMPLE_GUIDANCE_SCALE2,
                             generator=_gen,
-                            cond_with_prompt=args.cond_with_prompt,
+                            # cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -1884,7 +2040,7 @@ def main():
                             num_inference_steps=SAMPLE_INFERENCE_STEPS,
                             guidance_scale=1.0,
                             generator=_gen,
-                            cond_with_prompt=args.cond_with_prompt,
+                            # cond_with_prompt=args.cond_with_prompt,
                             positive_condition=args.cond_positive_text,
                             negative_condition=args.cond_negative_text,
                         ).images
@@ -1980,6 +2136,7 @@ def main():
         train_loss = 0.0
         implicit_acc_accumulated = 0.0
         for step, batch in enumerate(train_dataloader):
+            # flush cache
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step and (not args.hard_skip_resume):
                 if step % args.gradient_accumulation_steps == 0:
@@ -2120,6 +2277,7 @@ def main():
                                                          args.resolution],
                                                          dtype=weight_dtype,
                                                          device=accelerator.device)[None, :].repeat(timesteps.size(0), 1)
+                        batch["caption"] = tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
                         prompt_batch = encode_prompt_sdxl(batch, 
                                                           text_encoders,
                                                            tokenizers,
@@ -2127,11 +2285,20 @@ def main():
                                                           caption_column='caption',
                                                            is_train=True,
                                                           )
+                        # TODO: Implement SDXL encode_prompt_sdxl
                     if args.train_method in ['dpo', 'cdpo']:
                         prompt_batch["prompt_embeds"] = prompt_batch["prompt_embeds"].repeat(2, 1, 1)
                         prompt_batch["pooled_prompt_embeds"] = prompt_batch["pooled_prompt_embeds"].repeat(2, 1)
                     unet_added_conditions = {"time_ids": add_time_ids,
                                             "text_embeds": prompt_batch["pooled_prompt_embeds"]}
+                    
+                    # Encode condition tokens for SDXL (CSFT/CDPO)
+                    if args.train_method in ['csft', 'cdpo']:
+                        # cond_texts = batch["cond_texts"]
+                        cond_texts = tokenizer.batch_decode(batch["cond_input_ids"], skip_special_tokens=True)
+                        cond_embeds = encode_condition_sdxl(cond_texts, text_encoders, tokenizers)
+                        # For CDPO, cond_embeds is already [2*B, seq_len, 1280] (win + lose)
+                        # For CSFT, cond_embeds is already [2*B, seq_len, 1280] (flattened in collate)
                 else: # sd1.5
                     # Get the text embedding for conditioning
                     if args.train_method in ['csft']:
@@ -2165,7 +2332,12 @@ def main():
                 assert noise_scheduler.config.prediction_type == "epsilon"
                 target = noise
                 if args.simultaneous_conditioning:
-                    encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
+                    if not args.sdxl:
+                        encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
+                    else:
+                        prompt_batch["prompt_embeds"] = torch.cat([prompt_batch["prompt_embeds"], prompt_batch["prompt_embeds"]], dim=0)
+                        prompt_batch["pooled_prompt_embeds"] = torch.cat([prompt_batch["pooled_prompt_embeds"], prompt_batch["pooled_prompt_embeds"]], dim=0)
+                        unet_added_conditions["text_embeds"] = prompt_batch["pooled_prompt_embeds"]
 
                 if args.ip_adapter:
                     if args.jeremy_conditioning:
@@ -2202,12 +2374,22 @@ def main():
                             null_cond_tokens
                         )
                     else:
-                        model_pred = unet(
-                            noisy_latents,
-                            timesteps,
-                            encoder_hidden_states, # TODO: only support SD1.5 for now
-                            torch.cat([cond_tokens, encoder_hidden_states], dim=1) if args.cond_with_prompt else cond_tokens
-                        )
+                        if args.sdxl:
+                            # SDXL with IPAdapter: Pass cond_embeds and added_cond_kwargs
+                            model_pred = unet(
+                                noisy_latents,
+                                timesteps,
+                                prompt_batch["prompt_embeds"],
+                                cond_embeds=cond_embeds,
+                                added_cond_kwargs=unet_added_conditions
+                            )
+                        else:
+                            model_pred = unet(
+                                noisy_latents,
+                                timesteps,
+                                encoder_hidden_states, # TODO: only support SD1.5 for now
+                                torch.cat([cond_tokens, encoder_hidden_states], dim=1) if args.cond_with_prompt else cond_tokens
+                            )
                 else:               
                 # Make the prediction from the model we're learning
                     model_batch_args = (noisy_latents,
@@ -2215,6 +2397,8 @@ def main():
                                         prompt_batch["prompt_embeds"] if args.sdxl else encoder_hidden_states)
                     added_cond_kwargs = unet_added_conditions if args.sdxl else None
                 
+                    # TODO: SDXL CSFT/CDPO - This section handles SD1.5 condition tokens
+                    # For SDXL, need to properly handle condition tokens with prompt_embeds instead of encoder_hidden_states
                     if cond_adapter is not None:
                         adapter_module = accelerator.unwrap_model(cond_adapter)
                         adapter_dtype = next(adapter_module.parameters()).dtype
@@ -2242,11 +2426,22 @@ def main():
                     
                     with torch.no_grad(): # Get the reference policy (unet) prediction
                         if args.ip_adapter:
-                            ref_pred = ref_unet(
-                                        noisy_latents,
-                                        timesteps,
-                                        encoder_hidden_states, # TODO: only support SD1.5 for now
-                                    ).sample.detach()
+                            if args.sdxl:
+                                # SDXL IPAdapter - Note: DPO doesn't use condition tokens, only CDPO does
+                                ref_pred = ref_unet(
+                                    noisy_latents,
+                                    timesteps,
+                                    prompt_batch["prompt_embeds"],
+                                    cond_embeds=None, # DPO doesn't use condition tokens
+                                    added_cond_kwargs=unet_added_conditions
+                                ).detach()
+                            else:
+                                # SD1.5 IPAdapter
+                                ref_pred = ref_unet(
+                                    noisy_latents,
+                                    timesteps,
+                                    encoder_hidden_states,
+                                ).sample.detach()
                         else:
                             ref_pred = ref_unet(
                                         *model_batch_args,
@@ -2293,7 +2488,7 @@ def main():
                                 win_ref_pred = ref_unet(
                                     win_noisy_latent,
                                     jeremy_win_timesteps,
-                                    encoder_hidden_states, # TODO: only support SD1.5 for now
+                                    encoder_hidden_states, # TODO: SDXL CSFT/CDPO - only support SD1.5 for now, need SDXL support
                                 ).sample.detach()
                                 lose_ref_pred = ref_unet(
                                     lose_noisy_latent,
@@ -2302,18 +2497,35 @@ def main():
                                 ).sample.detach()
                             else:
                                 if ref_unet.__class__.__name__ == "IPAdapter":
+                                    # SD1.5 IPAdapter
                                     ref_pred = ref_unet(
                                         noisy_latents,
                                         timesteps,
                                         encoder_hidden_states,
                                         torch.cat([cond_tokens, encoder_hidden_states], dim=1) if args.cond_with_prompt else cond_tokens
                                     ).detach()
-                                else:
+                                elif ref_unet.__class__.__name__ == "IPAdapter_SDXL":
                                     ref_pred = ref_unet(
-                                                noisy_latents,
-                                                timesteps,
-                                                encoder_hidden_states, # TODO: only support SD1.5 for now
-                                            ).sample.detach()
+                                        noisy_latents,
+                                        timesteps,
+                                        prompt_batch["prompt_embeds"],
+                                        cond_embeds=cond_embeds,
+                                        added_cond_kwargs=unet_added_conditions
+                                    ).detach()
+                                else:
+                                    if args.sdxl:
+                                        ref_pred = ref_unet(
+                                            noisy_latents,
+                                            timesteps,
+                                            prompt_batch["prompt_embeds"],
+                                            added_cond_kwargs=unet_added_conditions
+                                        ).sample.detach()
+                                    else:
+                                        ref_pred = ref_unet(
+                                                    noisy_latents,
+                                                    timesteps,
+                                                    encoder_hidden_states, # SD1.5 without IPAdapter
+                                                ).sample.detach()
                         else:
                             ref_pred = ref_unet(
                                         *model_batch_args,
@@ -2412,12 +2624,27 @@ def main():
                     with torch.inference_mode():
                         _gen = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                         if args.sdxl:
-                            images = sample_pipe(
-                                prompt=SAMPLE_PROMPTS,
-                                num_inference_steps=SAMPLE_INFERENCE_STEPS,
-                                guidance_scale=SAMPLE_GUIDANCE_SCALE,
-                                generator=_gen,
-                            ).images
+                            if args.ip_adapter:
+                                sample_kwargs = {
+                                    "self": sample_pipe,
+                                    "prompt": SAMPLE_PROMPTS,
+                                    "num_inference_steps": SAMPLE_INFERENCE_STEPS,
+                                    "guidance_scale": SAMPLE_GUIDANCE_SCALE,
+                                    "generator": _gen,
+                                }
+                                # Add condition tokens for CSFT/CDPO sampling
+                                if args.train_method in ['csft', 'cdpo']:
+                                    sample_kwargs["positive_condition"] = args.cond_positive_text
+                                    sample_kwargs["negative_condition"] = args.cond_negative_text
+                                
+                                images = sample_pipe.__call__(**sample_kwargs).images
+                            else:
+                                images = sample_pipe(
+                                    prompt=SAMPLE_PROMPTS,
+                                    num_inference_steps=SAMPLE_INFERENCE_STEPS,
+                                    guidance_scale=SAMPLE_GUIDANCE_SCALE,
+                                    generator=_gen,
+                                ).images
                         else:
                             if args.ip_adapter:
                                 images = sample_pipe.__call__(
@@ -2426,7 +2653,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=SAMPLE_GUIDANCE_SCALE,
                                     generator=_gen,
-                                    cond_with_prompt=args.cond_with_prompt,
+                                    # cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images
@@ -2436,7 +2663,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=SAMPLE_GUIDANCE_SCALE2,
                                     generator=_gen,
-                                    cond_with_prompt=args.cond_with_prompt,
+                                    # cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images
@@ -2446,7 +2673,7 @@ def main():
                                     num_inference_steps=SAMPLE_INFERENCE_STEPS,
                                     guidance_scale=1.0,
                                     generator=_gen,
-                                    cond_with_prompt=args.cond_with_prompt,
+                                    # cond_with_prompt=args.cond_with_prompt,
                                     positive_condition=args.cond_positive_text,
                                     negative_condition=args.cond_negative_text,
                                 ).images
@@ -2487,6 +2714,11 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                         logger.info("Pretty sure saving/loading is fixed but proceed cautiously")
+
+                # Reset dataloader for streaming if we've reached the epoch boundary
+                if args.streaming and args.streaming_reset_every_n_steps > 0 and (global_step % num_update_steps_per_epoch == 0) and global_step > 0:
+                    logger.info(f"Resetting streaming dataloader at step {global_step} (end of epoch {epoch})")
+                    break
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if args.train_method in ['dpo', 'cdpo']:

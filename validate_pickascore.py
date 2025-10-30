@@ -13,6 +13,7 @@ from diffusers import (
     StableDiffusionPipeline,
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
+    AutoencoderKL,
 )
 
 from cond_sd15 import (
@@ -23,6 +24,12 @@ from cond_sd15 import (
     init_adapter,
 )
 
+from cond_sdxl import (
+    SDXLConditionAdapter,
+    IPAdapter_SDXL,
+    init_adapter_SDXL,
+    monkey_patch_sdxl_pipeline_for_ipadapter,
+)
 
 def detect_sdxl_from_model_name(model_name: str) -> bool:
     return 'stable-diffusion-xl' in model_name or 'sdxl' in model_name.lower()
@@ -48,6 +55,10 @@ def build_pipelines(
         pipe_base = StableDiffusionXLPipeline.from_pretrained(
             pretrained_model_name, torch_dtype=torch_dtype, variant="fp16", use_safetensors=True
         )
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch_dtype
+        )
+        pipe_base.vae = vae
     else:
         pipe_base = StableDiffusionPipeline.from_pretrained(
             pretrained_model_name, torch_dtype=torch_dtype
@@ -128,6 +139,27 @@ def build_pipelines(
                         )
                     except Exception as e:
                         print(f"[WARN] Failed to load/patch conditional adapter at {adapter_path}: {e}")
+        elif is_sdxl:
+            if enable_ipadapter and pipe_dpo is not None:
+                image_proj_model = None
+                ca_path = None
+                if cond_adapter_subpath and os.path.isdir(cond_adapter_subpath):
+                    ca_path = cond_adapter_subpath
+                elif dpo_ckpt_path and os.path.isdir(os.path.join(dpo_ckpt_path, 'cond_adapter')):
+                    ca_path = os.path.join(dpo_ckpt_path, 'cond_adapter')
+                if ca_path is not None and os.path.isdir(ca_path):
+                    try:
+                        image_proj_model = SDXLConditionAdapter.from_pretrained(ca_path, projector_type=cond_projector_type, mlp_hidden_dim=cond_mlp_hidden_dim).to(device)
+                    except Exception as e:
+                        print(f"[WARN] Failed to load cond_adapter at {ca_path}: {e}. Falling back to default SDXLConditionAdapter().")
+                if image_proj_model is None:
+                    image_proj_model = SDXLConditionAdapter(projector_type=cond_projector_type, mlp_hidden_dim=cond_mlp_hidden_dim).to(device)
+
+                adapter_modules = init_adapter_SDXL(pipe_dpo.unet)
+                ip_ckpt_root = ipadapter_ckpt if ipadapter_ckpt else dpo_ckpt_path
+                ip_unet = IPAdapter_SDXL(pipe_dpo.unet, image_proj_model, adapter_modules, ckpt_path=ip_ckpt_root).to(device)
+                pipe_dpo.unet = ip_unet
+                monkey_patch_sdxl_pipeline_for_ipadapter(pipe_dpo)
 
     return pipe_base, pipe_dpo
 
@@ -196,10 +228,10 @@ def generate_image(pipe, prompt: str, seed: int, guidance_scale: float, guidance
     if extra_kwargs:
         call_kwargs.update(extra_kwargs)
     # Check whether unet's class is IPAdapter
-    is_ipadapter = pipe.unet.__class__.__name__ == "IPAdapter"
+    is_ipadapter = pipe.unet.__class__.__name__ == "IPAdapter" or pipe.unet.__class__.__name__ == "IPAdapter_SDXL"
     # You can use is_ipadapter as needed, e.g., for debugging or conditional logic
     if is_ipadapter:
-        image = pipe.__call__(self=pipe, reference_conditional_guidance=reference_conditional_guidance, decomposed_additive_guidance=decomposed_additive_guidance, **call_kwargs).images[0]
+        image = pipe.__call__(self=pipe, decomposed_additive_guidance=decomposed_additive_guidance, **call_kwargs).images[0]
     else:
         image = pipe(**call_kwargs).images[0]
     return image
