@@ -618,14 +618,28 @@ def main():
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    # Only use DDP kwargs when not using FSDP or DeepSpeed
+    # FSDP and DeepSpeed handle parameters differently and don't need DDP kwargs
+    kwargs_handlers = []
+    from accelerate.state import PartialState
+    try:
+        state = PartialState()
+        if state.distributed_type not in [accelerate.utils.DistributedType.FSDP, accelerate.utils.DistributedType.DEEPSPEED]:
+            kwargs_handlers = [
+                accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
+            ]
+    except:
+        # If we can't determine the distributed type, default to DDP kwargs
+        kwargs_handlers = [
+            accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
+        ]
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[
-            accelerate.utils.DistributedDataParallelKwargs(find_unused_parameters=True)
-        ],
+        kwargs_handlers=kwargs_handlers,
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -1418,13 +1432,13 @@ def main():
 
                             win_parts = [
                                 "win",
-                                cond_text(example["win_aesthetic"], example["lose_aesthetic"], drop_prob=0.25),
+                                cond_text(example["win_aesthetic"], example["lose_aesthetic"], drop_prob=0.20),
                                 # cond_text(example["win_pickscore"], example["lose_pickscore"]),
                                 # cond_text(example["win_hps_score"], example["lose_hps_score"]),
                             ]
                             lose_parts = [
                                 "lose",
-                                cond_text(example["lose_aesthetic"], example["win_aesthetic"], drop_prob=0.25),
+                                cond_text(example["lose_aesthetic"], example["win_aesthetic"], drop_prob=0.20),
                                 # cond_text(example["lose_pickscore"], example["win_pickscore"]),
                                 # cond_text(example["lose_hps_score"], example["win_hps_score"]),
                             ]
@@ -1433,11 +1447,11 @@ def main():
                             if caption_val:
                                 win_parts.append(cond_text(example["win_pickscore"], example["lose_pickscore"]))
                                 win_parts.append(cond_text(example["win_hps_score"], example["lose_hps_score"]))
-                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.05))
+                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.20))
                                 
                                 lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
                                 lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
-                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.05))
+                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.20))
                             else:
                                 win_parts.append("tie")
                                 win_parts.append("tie")
@@ -1819,7 +1833,9 @@ def main():
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
-        drop_last=True
+        drop_last=True,
+        # pin_memory=True,
+        # prefetch_factor=2 if args.dataloader_num_workers > 0 else None
     )
     ##### END BIG OLD DATASET BLOCK #####
     
@@ -1880,15 +1896,15 @@ def main():
     if args.sdxl:
         text_encoder_one.to(accelerator.device, dtype=weight_dtype)
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-        print("offload vae (this actually stays as CPU)")
-        vae = accelerate.cpu_offload(vae)
-        print("Offloading text encoders to cpu")
-        text_encoder_one = accelerate.cpu_offload(text_encoder_one)
-        text_encoder_two = accelerate.cpu_offload(text_encoder_two)
+        # print("offload vae (this actually stays as CPU)")
+        # vae = accelerate.cpu_offload(vae)
+        # print("Offloading text encoders to cpu")
+        # text_encoder_one = accelerate.cpu_offload(text_encoder_one)
+        # text_encoder_two = accelerate.cpu_offload(text_encoder_two)
         if args.train_method in ['dpo', 'cdpo']:
             ref_unet.to(accelerator.device, dtype=weight_dtype)
-            print("offload ref_unet")
-            ref_unet = accelerate.cpu_offload(ref_unet)
+        #     print("offload ref_unet")
+        #     ref_unet = accelerate.cpu_offload(ref_unet)
     else:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
         if args.train_method in ['dpo', 'cdpo']:
