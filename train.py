@@ -2747,13 +2747,13 @@ def main():
                             os.makedirs(save_path, exist_ok=True)
                         
                         # Wait for directory to be created
-                        # accelerator.wait_for_everyone()
+                        accelerator.wait_for_everyone()
                         
                         # Save state (all processes participate with DeepSpeed)
                         accelerator.save_state(save_path)
                         
                         # Wait for all saves to complete
-                        # accelerator.wait_for_everyone()
+                        accelerator.wait_for_everyone()
                         
                         if accelerator.is_main_process:
                             logger.info(f"✓ Successfully saved checkpoint to {save_path}")
