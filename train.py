@@ -1222,57 +1222,57 @@ def main():
                 
                 # Robustly derive label from multiple possible encodings (reversed from build_all_scores_hf_dataset.py)
                 # When jpg_0 wins (l0 > l1), label_0 = 1
-                def decode_label(sample_idx):
-                    l0_raw = examples.get('label_0.txt', examples.get('label_0', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
-                    l1_raw = examples.get('label_1.txt', examples.get('label_1', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                # def decode_label(sample_idx):
+                #     l0_raw = examples.get('label_0.txt', examples.get('label_0', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                #     l1_raw = examples.get('label_1.txt', examples.get('label_1', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
                     
-                    def decode_numeric(value):
-                        if isinstance(value, (bytes, bytearray)):
-                            try:
-                                s = value.decode('utf-8', errors='ignore').strip().strip('"')
-                            except Exception:
-                                return None
-                        elif isinstance(value, str):
-                            s = value.strip().strip('"')
-                        elif isinstance(value, (int, float, np.floating, np.integer)):
-                            return float(value)
-                        else:
-                            return None
-                        try:
-                            return float(s)
-                        except Exception:
-                            return None
+                #     def decode_numeric(value):
+                #         if isinstance(value, (bytes, bytearray)):
+                #             try:
+                #                 s = value.decode('utf-8', errors='ignore').strip().strip('"')
+                #             except Exception:
+                #                 return None
+                #         elif isinstance(value, str):
+                #             s = value.strip().strip('"')
+                #         elif isinstance(value, (int, float, np.floating, np.integer)):
+                #             return float(value)
+                #         else:
+                #             return None
+                #         try:
+                #             return float(s)
+                #         except Exception:
+                #             return None
                     
-                    l0 = decode_numeric(l0_raw)
-                    l1 = decode_numeric(l1_raw)
+                #     l0 = decode_numeric(l0_raw)
+                #     l1 = decode_numeric(l1_raw)
                     
-                    label_value = None
-                    if l0 is not None and l1 is not None:
-                        # REVERSED: if l0 > l1, jpg_0 wins, so label_0 = 1
-                        if l0 > l1:
-                            label_value = 1
-                        elif l1 > l0:
-                            label_value = 0
-                    elif l0 is not None:
-                        # REVERSED: if l0 >= 0.5, jpg_0 wins, so label_0 = 1
-                        if l0 >= 0.5:
-                            label_value = 1
-                        else:
-                            label_value = 0
-                    elif l1 is not None:
-                        # REVERSED: if l1 >= 0.5, jpg_1 wins, so label_0 = 0
-                        if l1 >= 0.5:
-                            label_value = 0
-                        else:
-                            label_value = 1
+                #     label_value = None
+                #     if l0 is not None and l1 is not None:
+                #         # REVERSED: if l0 > l1, jpg_0 wins, so label_0 = 1
+                #         if l0 > l1:
+                #             label_value = 1
+                #         elif l1 > l0:
+                #             label_value = 0
+                #     elif l0 is not None:
+                #         # REVERSED: if l0 >= 0.5, jpg_0 wins, so label_0 = 1
+                #         if l0 >= 0.5:
+                #             label_value = 1
+                #         else:
+                #             label_value = 0
+                #     elif l1 is not None:
+                #         # REVERSED: if l1 >= 0.5, jpg_1 wins, so label_0 = 0
+                #         if l1 >= 0.5:
+                #             label_value = 0
+                #         else:
+                #             label_value = 1
                     
-                    if label_value is None:
-                        label_value = -1  # Invalid/tie
+                #     if label_value is None:
+                #         label_value = -1  # Invalid/tie
                     
-                    return label_value
+                #     return label_value
                 
-                num_samples = len(examples.get('jpg_0.jpg', examples.get('jpg_0', [])))
-                labels = [decode_label(i) for i in range(num_samples)]
+                # num_samples = len(examples.get('jpg_0.jpg', examples.get('jpg_0', [])))
+                # labels = [decode_label(i) for i in range(num_samples)]
                 
                 # Debug: check what fields are available for unique identification
                 # print(f"DEBUG: Available fields: {list(examples.keys())}")
@@ -1282,9 +1282,9 @@ def main():
                 # if '__key__' in examples:
                 #     print(f"DEBUG: __key__ sample: {examples['__key__'][:2] if len(examples.get('__key__', [])) >= 2 else examples.get('__key__')}")
                 
-                # labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
-                # # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
-                # labels = [int(labels[i]) for i in range(len(labels))]
+                labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
+                # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
+                labels = [int(labels[i]) for i in range(len(labels))]
                 examples_mapped = {
                     'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
                     'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
@@ -2637,7 +2637,7 @@ def main():
                 implicit_acc_accumulated = 0.0
 
                 # Qualitative sampling every N steps (main process only)
-                if accelerator.is_main_process and (global_step % SAMPLE_EVERY_STEPS == 0):
+                if accelerator.is_main_process and (global_step % SAMPLE_EVERY_STEPS == 0) and False:
                     _build_or_update_sample_pipeline()
                     # Log a quick weight checksum to verify model weight changes
                     try:
@@ -2747,13 +2747,13 @@ def main():
                             os.makedirs(save_path, exist_ok=True)
                         
                         # Wait for directory to be created
-                        accelerator.wait_for_everyone()
+                        # accelerator.wait_for_everyone()
                         
                         # Save state (all processes participate with DeepSpeed)
                         accelerator.save_state(save_path)
                         
                         # Wait for all saves to complete
-                        accelerator.wait_for_everyone()
+                        # accelerator.wait_for_everyone()
                         
                         if accelerator.is_main_process:
                             logger.info(f"✓ Successfully saved checkpoint to {save_path}")

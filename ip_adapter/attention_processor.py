@@ -460,7 +460,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
                 # Residual connection and split back
                 ip_hidden_states = fused_states + fused_attn_out
                 # MLP block for self-attention
-                # ip_hidden_states, encoder_hidden_states = torch.split(fused_states, [orig_ip_len, orig_enc_len], dim=1)
+                ip_hidden_states, encoder_hidden_states = torch.split(ip_hidden_states, [orig_ip_len, orig_enc_len], dim=1)
                 ip_hidden_states = ip_hidden_states + self.ff_sa(self.norm_mlp_sa(ip_hidden_states))
                 
                 # 2. Cross-Attention between fused conditioning and latents
