@@ -907,21 +907,33 @@ def main():
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
-            # Save UNet and optional conditional adapter. Unwrap to handle DDP/FSDP wrappers.
+            # Save UNet and optional conditional adapter. Unwrap to handle DDP/FSDP/DeepSpeed wrappers.
             for model in list(models):
                 unwrapped = accelerator.unwrap_model(model)
-                if isinstance(unwrapped, UNet2DConditionModel):
+                
+                # For DeepSpeed, need to check class name as isinstance may fail
+                model_class_name = unwrapped.__class__.__name__
+                
+                if isinstance(unwrapped, IPAdapter_SDXL) or model_class_name == 'IPAdapter_SDXL':
+                    # IPAdapter_SDXL wraps the actual UNet, save it specially
+                    print(f"Saving IPAdapter_SDXL to {output_dir}/ip_adapter")
+                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
+                elif isinstance(unwrapped, IPAdapter) or model_class_name == 'IPAdapter':
+                    # IPAdapter wraps the actual UNet, save it specially  
+                    print(f"Saving IPAdapter to {output_dir}/ip_adapter")
+                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
+                elif isinstance(unwrapped, UNet2DConditionModel) or model_class_name == 'UNet2DConditionModel':
+                    print(f"Saving UNet to {output_dir}/unet")
                     unwrapped.save_pretrained(os.path.join(output_dir, "unet"))
-                elif isinstance(unwrapped, SD15ConditionAdapter):
+                elif isinstance(unwrapped, SDXLConditionAdapter) or model_class_name == 'SDXLConditionAdapter':
+                    print(f"Saving SDXLConditionAdapter to {output_dir}/cond_adapter")
                     unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
-                # TODO: SDXL CSFT/CDPO - Add save support for SDXLConditionAdapter
-                elif isinstance(unwrapped, SDXLConditionAdapter):
+                elif isinstance(unwrapped, SD15ConditionAdapter) or model_class_name == 'SD15ConditionAdapter':
+                    print(f"Saving SD15ConditionAdapter to {output_dir}/cond_adapter")
                     unwrapped.save_pretrained(os.path.join(output_dir, "cond_adapter"))
-                elif isinstance(unwrapped, IPAdapter):
-                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
-                # TODO: SDXL CSFT/CDPO - Add save support for IPAdapter_SDXL
-                elif isinstance(unwrapped, IPAdapter_SDXL):
-                    unwrapped.save_pretrained(os.path.join(output_dir, "ip_adapter"), cond_only=args.csft_cond_only)
+                else:
+                    print(f"Warning: Unknown model type {model_class_name}, skipping custom save")
+                    
                 if len(weights) > 0:
                     weights.pop()
 
@@ -2725,11 +2737,31 @@ def main():
                         logger.warning(f"Failed to log samples at step {global_step}: {e}")
 
                 if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
+                    try:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        logger.info(f"Starting checkpoint save to {save_path}...")
+                        
+                        # For DeepSpeed, need to save from all processes
+                        # Only main process creates the directory
+                        if accelerator.is_main_process:
+                            os.makedirs(save_path, exist_ok=True)
+                        
+                        # Wait for directory to be created
+                        accelerator.wait_for_everyone()
+                        
+                        # Save state (all processes participate with DeepSpeed)
                         accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        logger.info("Pretty sure saving/loading is fixed but proceed cautiously")
+                        
+                        # Wait for all saves to complete
+                        accelerator.wait_for_everyone()
+                        
+                        if accelerator.is_main_process:
+                            logger.info(f"✓ Successfully saved checkpoint to {save_path}")
+                            logger.info(f"  - Checkpoint contains: {os.listdir(save_path)}")
+                    except Exception as e:
+                        logger.error(f"Failed to save checkpoint at step {global_step}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
 
                 # Reset dataloader for streaming if we've reached the epoch boundary
                 if args.streaming and args.streaming_reset_every_n_steps > 0 and (global_step % num_update_steps_per_epoch == 0) and global_step > 0:

@@ -310,7 +310,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
 
     def add_cross_attention_to_latent(self):
         self.cond_hidden_size = self.cross_attention_dim if self.cross_attention_dim != 2048 else self.hidden_size
-        self.mlp_hidden_dim = self.cross_attention_dim if self.cross_attention_dim != 2048 else 768*4
+        self.mlp_hidden_dim = self.cross_attention_dim * 4 if self.cross_attention_dim != 2048 else 768*4
         # self-attention layers for conditioning fusion
         self.norm_sa = nn.LayerNorm(self.cross_attention_dim)
         self.to_q_sa = nn.Linear(self.cross_attention_dim, self.cond_hidden_size, bias=False)
