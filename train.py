@@ -851,6 +851,7 @@ def main():
     if args.gradient_checkpointing or args.sdxl:
         print("Enabling gradient checkpointing on UNet, either because you asked for this or because you're using SDXL")
         unet.enable_gradient_checkpointing()
+        unet.enable_xformers_memory_efficient_attention()
     
     if args.ip_adapter:
         if args.sdxl:
@@ -866,7 +867,12 @@ def main():
             import copy
             ref_unet = copy.deepcopy(unet)
             print("!!!!!!!!!!!!!Ref UNet copied!!!!!!!!!!!!!!!")
-        ref_unet.requires_grad_(False)    
+        ref_unet.requires_grad_(False)
+        # Enable memory efficient attention on reference UNet as well
+        try:
+            ref_unet.unet.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
 
     if args.class_conditioning:
         if args.train_method not in ["csft", "cdpo"]:
@@ -895,8 +901,7 @@ def main():
             logger.warning(
                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
             )
-        if not args.ip_adapter:
-            unet.enable_xformers_memory_efficient_attention()
+        # unet.enable_xformers_memory_efficient_attention()
     else:
         raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -1459,11 +1464,11 @@ def main():
                             if caption_val:
                                 win_parts.append(cond_text(example["win_pickscore"], example["lose_pickscore"]))
                                 win_parts.append(cond_text(example["win_hps_score"], example["lose_hps_score"]))
-                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.20))
+                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.10))
                                 
                                 lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
                                 lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
-                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.20))
+                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.10))
                             else:
                                 win_parts.append("tie")
                                 win_parts.append("tie")
@@ -1914,9 +1919,10 @@ def main():
         # text_encoder_one = accelerate.cpu_offload(text_encoder_one)
         # text_encoder_two = accelerate.cpu_offload(text_encoder_two)
         if args.train_method in ['dpo', 'cdpo']:
+            ref_unet.eval()
             ref_unet.to(accelerator.device, dtype=weight_dtype)
         #     print("offload ref_unet")
-        #     ref_unet = accelerate.cpu_offload(ref_unet)
+            # ref_unet = accelerate.cpu_offload(ref_unet)
     else:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
         if args.train_method in ['dpo', 'cdpo']:
@@ -2264,11 +2270,18 @@ def main():
                     timesteps = 250 * timesteps_0_to_3 + 249
                 
                 if args.train_method in ['dpo', 'cdpo']: # make timesteps and noise same for pairs in DPO/CDPO
-                    timesteps = timesteps.chunk(2)[0].repeat(2)
-                    noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
-                    if args.simultaneous_conditioning:
-                        timesteps = timesteps.chunk(4)[0].repeat(4)
-                        noise = noise.chunk(4)[0].repeat(4, 1, 1, 1)
+                    pair_factor = 4 if args.simultaneous_conditioning else 2
+                    base = latents.shape[0] // pair_factor
+                    # Memory-safe duplication using expand (views) instead of repeat (copies)
+                    t_base = timesteps[:base]
+                    timesteps = t_base.unsqueeze(1).expand(-1, pair_factor).reshape(-1)
+                    n_base = noise[:base]
+                    n_shape = n_base.shape  # (base, C, H, W)
+                    noise = (
+                        n_base.unsqueeze(1)
+                             .expand(-1, pair_factor, n_shape[1], n_shape[2], n_shape[3])
+                             .reshape(-1, n_shape[1], n_shape[2], n_shape[3])
+                    )
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -2315,8 +2328,13 @@ def main():
                                                           )
                         # TODO: Implement SDXL encode_prompt_sdxl
                     if args.train_method in ['dpo', 'cdpo']:
-                        prompt_batch["prompt_embeds"] = prompt_batch["prompt_embeds"].repeat(2, 1, 1)
-                        prompt_batch["pooled_prompt_embeds"] = prompt_batch["pooled_prompt_embeds"].repeat(2, 1)
+                        # Memory-safe duplication without materializing large copies
+                        _pe = prompt_batch["prompt_embeds"]  # [B, S, D]
+                        _B, _S, _D = _pe.shape
+                        prompt_batch["prompt_embeds"] = _pe.unsqueeze(1).expand(-1, 2, -1, -1).reshape(-1, _S, _D)
+                        _ppe = prompt_batch["pooled_prompt_embeds"]  # [B, D2]
+                        _B2, _D2 = _ppe.shape
+                        prompt_batch["pooled_prompt_embeds"] = _ppe.unsqueeze(1).expand(-1, 2, -1).reshape(-1, _D2)
                     unet_added_conditions = {"time_ids": add_time_ids,
                                             "text_embeds": prompt_batch["pooled_prompt_embeds"]}
                     
@@ -2324,6 +2342,7 @@ def main():
                     if args.train_method in ['csft', 'cdpo']:
                         # cond_texts = batch["cond_texts"]
                         cond_texts = tokenizer.batch_decode(batch["cond_input_ids"], skip_special_tokens=True)
+
                         cond_embeds = encode_condition_sdxl(cond_texts, text_encoders, tokenizers)
                         # For CDPO, cond_embeds is already [2*B, seq_len, 1280] (win + lose)
                         # For CSFT, cond_embeds is already [2*B, seq_len, 1280] (flattened in collate)
@@ -2404,13 +2423,29 @@ def main():
                     else:
                         if args.sdxl:
                             # SDXL with IPAdapter: Pass cond_embeds and added_cond_kwargs
-                            model_pred = unet(
-                                noisy_latents,
+                            def unet_forward(noisy_latents, timesteps, prompt_embeds, cond_embeds, added_cond_kwargs):
+                                return unet(
+                                    noisy_latents,
+                                    timesteps,
+                                    prompt_embeds,
+                                    cond_embeds=cond_embeds,
+                                    added_cond_kwargs=added_cond_kwargs
+                                )
+                            model_pred = torch.utils.checkpoint.checkpoint(
+                                unet_forward,
+                                noisy_latents.requires_grad_(True),
                                 timesteps,
                                 prompt_batch["prompt_embeds"],
-                                cond_embeds=cond_embeds,
-                                added_cond_kwargs=unet_added_conditions
+                                cond_embeds,   
+                                unet_added_conditions
                             )
+                            # model_pred = unet(
+                            #     noisy_latents,
+                            #     timesteps,
+                            #     prompt_batch["prompt_embeds"],
+                            #     cond_embeds=cond_embeds,
+                            #     added_cond_kwargs=unet_added_conditions
+                            # )
                         else:
                             model_pred = unet(
                                 noisy_latents,
@@ -2613,14 +2648,14 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    if not args.use_adafactor: # Adafactor does itself, maybe could do here to cut down on code
+                    if not args.use_adafactor and not args.sdxl: # Adafactor does itself, maybe could do here to cut down on code
                         # Clip only trainable params; if csft_cond_only, UNet may be frozen
                         trainable_params = [p for p in unet.parameters() if p.requires_grad]
                         if len(trainable_params) > 0:
                             accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Checks if the accelerator has just performed an optimization step, if so do "end of batch" logging
             if accelerator.sync_gradients:

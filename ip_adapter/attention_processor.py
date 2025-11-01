@@ -327,12 +327,12 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.to_out_ca = nn.Linear(self.hidden_size, self.cross_attention_dim)
         
         # MLP for self-attention
-        self.norm_mlp_sa = nn.LayerNorm(self.cross_attention_dim)
-        self.ff_sa = nn.Sequential(
-            nn.Linear(self.cross_attention_dim, self.mlp_hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.mlp_hidden_dim, self.cross_attention_dim),
-        )
+        # self.norm_mlp_sa = nn.LayerNorm(self.cross_attention_dim)
+        # self.ff_sa = nn.Sequential(
+        #     nn.Linear(self.cross_attention_dim, self.mlp_hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(self.mlp_hidden_dim, self.cross_attention_dim),
+        # )
 
         # MLP for cross-attention
         self.norm_mlp_ca = nn.LayerNorm(self.cross_attention_dim)
@@ -347,8 +347,8 @@ class IPAttnProcessor2_0(torch.nn.Module):
         self.to_out_sa.bias.data.zero_()
         self.to_out_ca.weight.data.zero_()
         self.to_out_ca.bias.data.zero_()
-        self.ff_sa[-1].weight.data.zero_()
-        self.ff_sa[-1].bias.data.zero_()
+        # self.ff_sa[-1].weight.data.zero_()
+        # self.ff_sa[-1].bias.data.zero_()
         self.ff_ca[-1].weight.data.zero_()
         self.ff_ca[-1].bias.data.zero_()
         self.is_cross_attention_to_latent_added = True
@@ -461,7 +461,7 @@ class IPAttnProcessor2_0(torch.nn.Module):
                 ip_hidden_states = fused_states + fused_attn_out
                 # MLP block for self-attention
                 ip_hidden_states, encoder_hidden_states = torch.split(ip_hidden_states, [orig_ip_len, orig_enc_len], dim=1)
-                ip_hidden_states = ip_hidden_states + self.ff_sa(self.norm_mlp_sa(ip_hidden_states))
+                # ip_hidden_states = ip_hidden_states + self.ff_sa(self.norm_mlp_sa(ip_hidden_states))
                 
                 # 2. Cross-Attention between fused conditioning and latents
                 query_ca = self.to_q_ca(self.norm_ip_ca(ip_hidden_states))
