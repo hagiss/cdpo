@@ -456,6 +456,12 @@ def parse_args():
         default=0,
         help="If > 0 and using streaming, reset dataloader every N steps to simulate epochs."
     )
+    parser.add_argument(
+        "--data_skip_step",
+        type=int,
+        default=0,
+        help="Number of training steps to skip at the beginning (useful for resuming without loading checkpoint state)."
+    )
     # Conditional training/inference (SD1.5)
     parser.add_argument("--train_method", type=str, default=None, choices=["sft", "dpo", "csft", "cdpo"], help="Training method: sft/dpo/csft/cdpo")
     parser.add_argument("--csft", action='store_true', help="Alias for --train_method csft")
@@ -621,8 +627,8 @@ def main():
     # Only use DDP kwargs when not using FSDP or DeepSpeed
     # FSDP and DeepSpeed handle parameters differently and don't need DDP kwargs
     kwargs_handlers = []
-    from accelerate.state import PartialState
     try:
+        from accelerate.state import PartialState
         state = PartialState()
         if state.distributed_type not in [accelerate.utils.DistributedType.FSDP, accelerate.utils.DistributedType.DEEPSPEED]:
             kwargs_handlers = [
@@ -869,10 +875,10 @@ def main():
             print("!!!!!!!!!!!!!Ref UNet copied!!!!!!!!!!!!!!!")
         ref_unet.requires_grad_(False)
         # Enable memory efficient attention on reference UNet as well
-        try:
-            ref_unet.unet.enable_xformers_memory_efficient_attention()
-        except Exception:
-            pass
+        # try:
+        #     ref_unet.unet.enable_xformers_memory_efficient_attention()
+        # except Exception:
+        #     pass
 
     if args.class_conditioning:
         if args.train_method not in ["csft", "cdpo"]:
@@ -1022,13 +1028,31 @@ def main():
                                           relative_step=False)
 
     else:
-        optimizer = torch.optim.AdamW(
-            optim_params,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-        )
+        # optimizer = torch.optim.AdamW(
+        #     optim_params,
+        #     lr=args.learning_rate,
+        #     betas=(args.adam_beta1, args.adam_beta2),
+        #     weight_decay=args.adam_weight_decay,
+        #     eps=args.adam_epsilon,
+        # )
+        try:
+            from deepspeed.ops.adam import FusedAdam
+            optimizer = FusedAdam(
+                optim_params,
+                lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2),
+                eps=args.adam_epsilon,
+                adam_w_mode=True,                      # AdamW 모드
+                weight_decay=args.adam_weight_decay,   # 파라미터 그룹 분리했으면 그룹별로 들어감
+            )
+        except Exception:
+            optimizer = torch.optim.AdamW(
+                optim_params,
+                lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2),
+                weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon,
+            )
 
         
     # Load scores mapping if provided
@@ -1227,57 +1251,57 @@ def main():
                 
                 # Robustly derive label from multiple possible encodings (reversed from build_all_scores_hf_dataset.py)
                 # When jpg_0 wins (l0 > l1), label_0 = 1
-                # def decode_label(sample_idx):
-                #     l0_raw = examples.get('label_0.txt', examples.get('label_0', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
-                #     l1_raw = examples.get('label_1.txt', examples.get('label_1', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                def decode_label(sample_idx):
+                    l0_raw = examples.get('label_0.txt', examples.get('label_0', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
+                    l1_raw = examples.get('label_1.txt', examples.get('label_1', [None] * len(examples.get('jpg_0.jpg', []))))[sample_idx]
                     
-                #     def decode_numeric(value):
-                #         if isinstance(value, (bytes, bytearray)):
-                #             try:
-                #                 s = value.decode('utf-8', errors='ignore').strip().strip('"')
-                #             except Exception:
-                #                 return None
-                #         elif isinstance(value, str):
-                #             s = value.strip().strip('"')
-                #         elif isinstance(value, (int, float, np.floating, np.integer)):
-                #             return float(value)
-                #         else:
-                #             return None
-                #         try:
-                #             return float(s)
-                #         except Exception:
-                #             return None
+                    def decode_numeric(value):
+                        if isinstance(value, (bytes, bytearray)):
+                            try:
+                                s = value.decode('utf-8', errors='ignore').strip().strip('"')
+                            except Exception:
+                                return None
+                        elif isinstance(value, str):
+                            s = value.strip().strip('"')
+                        elif isinstance(value, (int, float, np.floating, np.integer)):
+                            return float(value)
+                        else:
+                            return None
+                        try:
+                            return float(s)
+                        except Exception:
+                            return None
                     
-                #     l0 = decode_numeric(l0_raw)
-                #     l1 = decode_numeric(l1_raw)
+                    l0 = decode_numeric(l0_raw)
+                    l1 = decode_numeric(l1_raw)
                     
-                #     label_value = None
-                #     if l0 is not None and l1 is not None:
-                #         # REVERSED: if l0 > l1, jpg_0 wins, so label_0 = 1
-                #         if l0 > l1:
-                #             label_value = 1
-                #         elif l1 > l0:
-                #             label_value = 0
-                #     elif l0 is not None:
-                #         # REVERSED: if l0 >= 0.5, jpg_0 wins, so label_0 = 1
-                #         if l0 >= 0.5:
-                #             label_value = 1
-                #         else:
-                #             label_value = 0
-                #     elif l1 is not None:
-                #         # REVERSED: if l1 >= 0.5, jpg_1 wins, so label_0 = 0
-                #         if l1 >= 0.5:
-                #             label_value = 0
-                #         else:
-                #             label_value = 1
+                    label_value = None
+                    if l0 is not None and l1 is not None:
+                        # REVERSED: if l0 > l1, jpg_0 wins, so label_0 = 1
+                        if l0 > l1:
+                            label_value = 1
+                        elif l1 > l0:
+                            label_value = 0
+                    elif l0 is not None:
+                        # REVERSED: if l0 >= 0.5, jpg_0 wins, so label_0 = 1
+                        if l0 > 0.5:
+                            label_value = 1
+                        else:
+                            label_value = 0
+                    elif l1 is not None:
+                        # REVERSED: if l1 >= 0.5, jpg_1 wins, so label_0 = 0
+                        if l1 > 0.5:
+                            label_value = 0
+                        else:
+                            label_value = 1
                     
-                #     if label_value is None:
-                #         label_value = -1  # Invalid/tie
+                    if label_value is None:
+                        label_value = -1  # Invalid/tie
                     
-                #     return label_value
+                    return label_value
                 
-                # num_samples = len(examples.get('jpg_0.jpg', examples.get('jpg_0', [])))
-                # labels = [decode_label(i) for i in range(num_samples)]
+                num_samples = len(examples.get('jpg_0.jpg', examples.get('jpg_0', [])))
+                labels = [decode_label(i) for i in range(num_samples)]
                 
                 # Debug: check what fields are available for unique identification
                 # print(f"DEBUG: Available fields: {list(examples.keys())}")
@@ -1287,9 +1311,9 @@ def main():
                 # if '__key__' in examples:
                 #     print(f"DEBUG: __key__ sample: {examples['__key__'][:2] if len(examples.get('__key__', [])) >= 2 else examples.get('__key__')}")
                 
-                labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
+                # labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
                 # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
-                labels = [int(labels[i]) for i in range(len(labels))]
+                # labels = [int(labels[i]) for i in range(len(labels))]
                 examples_mapped = {
                     'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
                     'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
@@ -1448,13 +1472,13 @@ def main():
                                 caption_val = caption_val[0] if caption_val else ""
 
                             win_parts = [
-                                "win",
+                                "win" if random.random() < 0.8 else "tie",
                                 cond_text(example["win_aesthetic"], example["lose_aesthetic"], drop_prob=0.20),
                                 # cond_text(example["win_pickscore"], example["lose_pickscore"]),
                                 # cond_text(example["win_hps_score"], example["lose_hps_score"]),
                             ]
                             lose_parts = [
-                                "lose",
+                                "lose" if random.random() < 0.8 else "tie",
                                 cond_text(example["lose_aesthetic"], example["win_aesthetic"], drop_prob=0.20),
                                 # cond_text(example["lose_pickscore"], example["win_pickscore"]),
                                 # cond_text(example["lose_hps_score"], example["win_hps_score"]),
@@ -1464,11 +1488,11 @@ def main():
                             if caption_val:
                                 win_parts.append(cond_text(example["win_pickscore"], example["lose_pickscore"]))
                                 win_parts.append(cond_text(example["win_hps_score"], example["lose_hps_score"]))
-                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.10))
+                                win_parts.append(cond_text(example["win_clip_score"], example["lose_clip_score"], drop_prob=0.15))
                                 
                                 lose_parts.append(cond_text(example["lose_pickscore"], example["win_pickscore"]))
                                 lose_parts.append(cond_text(example["lose_hps_score"], example["win_hps_score"]))
-                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.10))
+                                lose_parts.append(cond_text(example["lose_clip_score"], example["win_clip_score"], drop_prob=0.15))
                             else:
                                 win_parts.append("tie")
                                 win_parts.append("tie")
@@ -1545,8 +1569,11 @@ def main():
                 images = []
                 # Probably cleaner way to do this iteration
                 for im_0_bytes, im_1_bytes, label_0 in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0']):
-                    assert label_0 in (0, 1)
-                    im_bytes = im_0_bytes if label_0==1 else im_1_bytes
+                    # For tie/invalid labels, use dummy data (will be filtered out later)
+                    if label_0 not in (0, 1):
+                        im_bytes = im_0_bytes  # Use jpg_0 as dummy
+                    else:
+                        im_bytes = im_0_bytes if label_0==1 else im_1_bytes
                     images.append(Image.open(io.BytesIO(im_bytes)).convert("RGB"))
             else:
                 images = [image.convert("RGB") for image in examples[image_column]]
@@ -1571,8 +1598,8 @@ def main():
             if args.streaming and 'jpg_0.jpg' in examples:
                 # Map WebDataset columns to expected names
                 labels = [float(x.decode('utf-8') if isinstance(x, bytes) else x) for x in examples.get('label_0.txt', examples.get('label_0', []))]
-                # labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
-                labels = [int(labels[i]) for i in range(len(labels))]
+                labels = [-1 if labels[i]==0.5 else int(labels[i]) for i in range(len(labels))]
+                # labels = [int(labels[i]) for i in range(len(labels))]
                 examples_mapped = {
                     'jpg_0': examples.get('jpg_0.jpg', examples.get('jpg_0')),
                     'jpg_1': examples.get('jpg_1.jpg', examples.get('jpg_1')),
@@ -1633,9 +1660,13 @@ def main():
                     examples['hps_score'] = hps_scores_list
                 
                 for im_0_data, im_1_data, label_0, cap, pickscore, aesthetic, clip_score, hps_score in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['pickscore'], examples['aesthetic'], examples['clip_score'], examples['hps_score']):
-                    assert label_0 in (0, 1)
-                    im_win_data = im_0_data if label_0==1 else im_1_data
-                    im_lose_data = im_1_data if label_0==1 else im_0_data
+                    # For tie/invalid labels, use dummy data (will be filtered out later)
+                    if label_0 not in (0, 1):
+                        im_win_data = im_0_data
+                        im_lose_data = im_0_data
+                    else:
+                        im_win_data = im_0_data if label_0==1 else im_1_data
+                        im_lose_data = im_1_data if label_0==1 else im_0_data
                     
                     # Handle both bytes (non-streaming) and PIL Images (streaming)
                     if isinstance(im_win_data, bytes):
@@ -1645,15 +1676,26 @@ def main():
                         win_images.append(im_win_data.convert("RGB") if hasattr(im_win_data, 'convert') else im_win_data)
                         lose_images.append(im_lose_data.convert("RGB") if hasattr(im_lose_data, 'convert') else im_lose_data)
                     captions.append(cap)
-                    win_idx = 0 if label_0==1 else 1
-                    win_pickscore.append(normalize_pick(pickscore[win_idx]))
-                    lose_pickscore.append(normalize_pick(pickscore[1-win_idx]))
-                    win_aesthetic.append(normalize_aes(aesthetic[win_idx]))
-                    lose_aesthetic.append(normalize_aes(aesthetic[1-win_idx]))
-                    win_clip_score.append(normalize_clip(clip_score[win_idx]))
-                    lose_clip_score.append(normalize_clip(clip_score[1-win_idx]))
-                    win_hps_score.append(normalize_hps(hps_score[win_idx]))
-                    lose_hps_score.append(normalize_hps(hps_score[1-win_idx]))
+                    # For tie/invalid, use dummy scores (will be filtered out)
+                    if label_0 not in (0, 1):
+                        win_pickscore.append(1)  # dummy
+                        lose_pickscore.append(1)
+                        win_aesthetic.append(1)
+                        lose_aesthetic.append(1)
+                        win_clip_score.append(1)
+                        lose_clip_score.append(1)
+                        win_hps_score.append(1)
+                        lose_hps_score.append(1)
+                    else:
+                        win_idx = 0 if label_0==1 else 1
+                        win_pickscore.append(normalize_pick(pickscore[win_idx]))
+                        lose_pickscore.append(normalize_pick(pickscore[1-win_idx]))
+                        win_aesthetic.append(normalize_aes(aesthetic[win_idx]))
+                        lose_aesthetic.append(normalize_aes(aesthetic[1-win_idx]))
+                        win_clip_score.append(normalize_clip(clip_score[win_idx]))
+                        lose_clip_score.append(normalize_clip(clip_score[1-win_idx]))
+                        win_hps_score.append(normalize_hps(hps_score[win_idx]))
+                        lose_hps_score.append(normalize_hps(hps_score[1-win_idx]))
             elif 'pickapic' in args.dataset_name or 'mvv_full' in args.dataset_name:
                 win_images = []
                 lose_images = []
@@ -1665,9 +1707,13 @@ def main():
                 win_vila = []
                 lose_vila = []
                 for im_0_data, im_1_data, label_0, cap, mps_probs, vqa_scores, vila_scores in zip(examples['jpg_0'], examples['jpg_1'], examples['label_0'], examples['caption'], examples['mps_scores'], examples['vqa_scores'], examples['vila_scores']):
-                    assert label_0 in (0, 1)
-                    im_win_data = im_0_data if label_0==1 else im_1_data
-                    im_lose_data = im_1_data if label_0==1 else im_0_data
+                    # For tie/invalid labels, use dummy data (will be filtered out later)
+                    if label_0 not in (0, 1):
+                        im_win_data = im_0_data
+                        im_lose_data = im_0_data
+                    else:
+                        im_win_data = im_0_data if label_0==1 else im_1_data
+                        im_lose_data = im_1_data if label_0==1 else im_0_data
                     
                     # Handle both bytes (non-streaming) and PIL Images (streaming)
                     if isinstance(im_win_data, bytes):
@@ -1677,13 +1723,22 @@ def main():
                         win_images.append(im_win_data.convert("RGB") if hasattr(im_win_data, 'convert') else im_win_data)
                         lose_images.append(im_lose_data.convert("RGB") if hasattr(im_lose_data, 'convert') else im_lose_data)
                     captions.append(cap)
-                    win_idx = 0 if label_0==1 else 1
-                    win_mps.append(normalize_mps(mps_probs[win_idx]))
-                    lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
-                    win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
-                    lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
-                    win_vila.append(normalize_vila(vila_scores[win_idx]))
-                    lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
+                    # For tie/invalid, use dummy scores (will be filtered out)
+                    if label_0 not in (0, 1):
+                        win_mps.append(1)  # dummy
+                        lose_mps.append(1)
+                        win_vqa.append(1)
+                        lose_vqa.append(1)
+                        win_vila.append(1)
+                        lose_vila.append(1)
+                    else:
+                        win_idx = 0 if label_0==1 else 1
+                        win_mps.append(normalize_mps(mps_probs[win_idx]))
+                        lose_mps.append(normalize_mps(mps_probs[1-win_idx]))
+                        win_vqa.append(normalize_vqa(vqa_scores[win_idx]))
+                        lose_vqa.append(normalize_vqa(vqa_scores[1-win_idx]))
+                        win_vila.append(normalize_vila(vila_scores[win_idx]))
+                        lose_vila.append(normalize_vila(vila_scores[1-win_idx]))
             else:
                 # Fallback: single image datasets, treat image as win and duplicate as lose
                 for image, cap in zip(examples[image_column], examples[caption_column]):
@@ -1741,13 +1796,13 @@ def main():
                             caption_val = caption_val[0] if caption_val else ""
 
                         win_parts = [
-                            "win",
+                            "win" if random.random() < 0.8 else "tie",
                             cond_text(ex["win_aesthetic"], ex["lose_aesthetic"]),
                             # cond_text(ex["win_pickscore"], ex["lose_pickscore"]),
                             # cond_text(ex["win_hps_score"], ex["lose_hps_score"]),
                         ]
                         lose_parts = [
-                            "lose",
+                            "lose" if random.random() < 0.8 else "tie",
                             cond_text(ex["lose_aesthetic"], ex["win_aesthetic"]),
                             # cond_text(ex["lose_pickscore"], ex["win_pickscore"]),
                             # cond_text(ex["lose_hps_score"], ex["win_hps_score"]),
@@ -1913,16 +1968,15 @@ def main():
     if args.sdxl:
         text_encoder_one.to(accelerator.device, dtype=weight_dtype)
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-        # print("offload vae (this actually stays as CPU)")
-        # vae = accelerate.cpu_offload(vae)
-        # print("Offloading text encoders to cpu")
-        # text_encoder_one = accelerate.cpu_offload(text_encoder_one)
-        # text_encoder_two = accelerate.cpu_offload(text_encoder_two)
+        print("offload vae (this actually stays as CPU)")
+        vae = accelerate.cpu_offload(vae)
+        print("Offloading text encoders to cpu")
+        text_encoder_one = accelerate.cpu_offload(text_encoder_one)
+        text_encoder_two = accelerate.cpu_offload(text_encoder_two)
         if args.train_method in ['dpo', 'cdpo']:
-            ref_unet.eval()
             ref_unet.to(accelerator.device, dtype=weight_dtype)
-        #     print("offload ref_unet")
-            # ref_unet = accelerate.cpu_offload(ref_unet)
+            print("offload ref_unet")
+            ref_unet = accelerate.cpu_offload(ref_unet)
     else:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
         if args.train_method in ['dpo', 'cdpo']:
@@ -2129,6 +2183,8 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    if args.data_skip_step > 0:
+        logger.info(f"  Data skip steps = {args.data_skip_step} (will skip initial data batches)")
     global_step = 0
     first_epoch = 0
 
@@ -2163,6 +2219,8 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    # Track total steps processed for data_skip_step
+    total_steps_processed = 0
         
     #### START MAIN TRAINING LOOP #####
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -2175,6 +2233,15 @@ def main():
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step and (not args.hard_skip_resume):
                 if step % args.gradient_accumulation_steps == 0:
                     print(f"Dummy processing step {step}, will start training at {resume_step}")
+                continue
+            
+            # Skip initial data steps if data_skip_step is set
+            if args.data_skip_step > 0 and total_steps_processed < (args.data_skip_step * args.gradient_accumulation_steps):
+                total_steps_processed += 1
+                if total_steps_processed % 100 == 0:
+                    logger.info(f"Skipping data step {total_steps_processed}/{args.data_skip_step * args.gradient_accumulation_steps}")
+                if total_steps_processed == (args.data_skip_step * args.gradient_accumulation_steps):
+                    logger.info(f"✓ Completed skipping {args.data_skip_step} data steps, starting training now")
                 continue
             with accelerator.accumulate(unet):
                 # Convert images to latent space
@@ -2423,29 +2490,29 @@ def main():
                     else:
                         if args.sdxl:
                             # SDXL with IPAdapter: Pass cond_embeds and added_cond_kwargs
-                            def unet_forward(noisy_latents, timesteps, prompt_embeds, cond_embeds, added_cond_kwargs):
-                                return unet(
-                                    noisy_latents,
-                                    timesteps,
-                                    prompt_embeds,
-                                    cond_embeds=cond_embeds,
-                                    added_cond_kwargs=added_cond_kwargs
-                                )
-                            model_pred = torch.utils.checkpoint.checkpoint(
-                                unet_forward,
-                                noisy_latents.requires_grad_(True),
-                                timesteps,
-                                prompt_batch["prompt_embeds"],
-                                cond_embeds,   
-                                unet_added_conditions
-                            )
-                            # model_pred = unet(
-                            #     noisy_latents,
+                            # def unet_forward(noisy_latents, timesteps, prompt_embeds, cond_embeds, added_cond_kwargs):
+                            #     return unet(
+                            #         noisy_latents,
+                            #         timesteps,
+                            #         prompt_embeds,
+                            #         cond_embeds=cond_embeds,
+                            #         added_cond_kwargs=added_cond_kwargs
+                            #     )
+                            # model_pred = torch.utils.checkpoint.checkpoint(
+                            #     unet_forward,
+                            #     noisy_latents.requires_grad_(True),
                             #     timesteps,
                             #     prompt_batch["prompt_embeds"],
-                            #     cond_embeds=cond_embeds,
-                            #     added_cond_kwargs=unet_added_conditions
+                            #     cond_embeds,   
+                            #     unet_added_conditions
                             # )
+                            model_pred = unet(
+                                noisy_latents,
+                                timesteps,
+                                prompt_batch["prompt_embeds"],
+                                cond_embeds=cond_embeds,
+                                added_cond_kwargs=unet_added_conditions
+                            )
                         else:
                             model_pred = unet(
                                 noisy_latents,
@@ -2647,21 +2714,42 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    if not args.use_adafactor and not args.sdxl: # Adafactor does itself, maybe could do here to cut down on code
-                        # Clip only trainable params; if csft_cond_only, UNet may be frozen
-                        trainable_params = [p for p in unet.parameters() if p.requires_grad]
-                        if len(trainable_params) > 0:
-                            accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                
+                # Calculate gradient norm before optimizer step (more efficient version)
+                # if accelerator.sync_gradients:
+                #     # Collect all trainable parameters
+                #     trainable_params = []
+                #     if not args.csft_cond_only:
+                #         trainable_params += [p for p in unet.parameters() if p.requires_grad]
+                #     else:
+                #         if cond_adapter is not None and not args.ip_adapter:
+                #             trainable_params += [p for p in cond_adapter.parameters() if p.requires_grad]
+                #         if args.ip_adapter and hasattr(unet, "adapter_modules"):
+                #             trainable_params += [p for p in unet.adapter_modules.parameters() if p.requires_grad]
+                #             trainable_params += [p for p in unet.image_proj_model.parameters() if p.requires_grad]
+                #     if class_embed_layer is not None:
+                #         trainable_params += [p for p in class_embed_layer.parameters() if p.requires_grad]
+                    
+                #     # Efficient gradient norm calculation (single GPU operation)
+                #     grads = [p.grad.detach() for p in trainable_params if p.grad is not None]
+                #     if len(grads) > 0:
+                #         total_norm_sq = sum([g.norm(2).pow(2) for g in grads])
+                #         grad_norm = total_norm_sq.sqrt().item()
+                #     else:
+                #         grad_norm = 0.0
+                # else:
+                #     grad_norm = 0.0
+                
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
 
             # Checks if the accelerator has just performed an optimization step, if so do "end of batch" logging
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                # accelerator.log({"grad_norm": grad_norm}, step=global_step)
                 if args.train_method in ['dpo', 'cdpo']:
                     accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
                     accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
